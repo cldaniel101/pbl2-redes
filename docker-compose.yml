@@ -1,0 +1,28 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: pingpong-server:latest
+    container_name: pbl_server
+    ports:
+      - "9000:9000"  
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9000 || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  client:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    image: pingpong-client:latest
+    stdin_open: true  
+    tty: true         
+    environment:
+      SERVER_ADDR: "server:9000"
+      PING_INTERVAL_MS: "2000"
+    depends_on:
+      server:
+        condition: service_healthy
