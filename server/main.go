@@ -4,106 +4,67 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"pingpong/server/game"
 	"pingpong/server/protocol"
 	"sync"
 	"time"
+	"encoding/json"
+	"strings"
 )
 
-// GameServer representa o servidor do jogo
+// Variáveis globais para a topologia do anel
+var (
+	allServers        []string
+	nextServerAddress string
+)
+
+// GameServer modificado para a lógica de token ring
 type GameServer struct {
+	// Atributos de estado local e comunicação com clientes
 	cardDB           *game.CardDB
 	packSystem       *game.PackSystem
 	playersOnline    map[string]*protocol.PlayerConn
 	matchmakingQueue []*protocol.PlayerConn
 	activeMatches    map[string]*game.Match
 	mu               sync.RWMutex
+	httpClient       *http.Client
+	serverAddress    string
+
+	// Novos atributos para a gestão do Token Ring
+	tokenMutex        sync.Mutex
+	hasToken          bool
+	tokenAcquiredChan chan bool // Canal para sinalizar que o token foi recebido
 }
 
-// NewGameServer cria um novo servidor do jogo
-func NewGameServer() *GameServer {
-	// Inicializa CardDB
+// NewGameServer cria um novo servidor de jogo.
+func NewGameServer(serverAddress string) *GameServer {
 	cardDB := game.NewCardDB()
 	if err := cardDB.LoadFromFile("cards.json"); err != nil {
 		log.Fatalf("[SERVER] Erro ao carregar cartas: %v", err)
 	}
 
-	// Inicializa sistema de pacotes
-	packConfig := game.PackConfig{
-		CardsPerPack: 3,
-		Stock:        100,
-		RNGSeed:      0, // seed aleatório
-	}
+	packConfig := game.PackConfig{CardsPerPack: 3, Stock: 100}
 	packSystem := game.NewPackSystem(packConfig, cardDB)
 
 	return &GameServer{
-		cardDB:           cardDB,
-		packSystem:       packSystem,
-		playersOnline:    make(map[string]*protocol.PlayerConn),
-		matchmakingQueue: make([]*protocol.PlayerConn, 0),
-		activeMatches:    make(map[string]*game.Match),
+		cardDB:            cardDB,
+		packSystem:        packSystem,
+		playersOnline:     make(map[string]*protocol.PlayerConn),
+		matchmakingQueue:  make([]*protocol.PlayerConn, 0),
+		activeMatches:     make(map[string]*game.Match),
+		httpClient:        &http.Client{Timeout: 5 * time.Second},
+		serverAddress:     serverAddress,
+		tokenAcquiredChan: make(chan bool, 1), // Canal com buffer para não bloquear
 	}
-}
-
-// tryCreateMatch verifica a fila de matchmaking e cria partidas
-func (gs *GameServer) tryCreateMatch() {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-
-	// Precisa de pelo menos 2 jogadores na fila
-	if len(gs.matchmakingQueue) < 2 {
-		return
-	}
-
-	// Pega os dois primeiros jogadores da fila
-	p1 := gs.matchmakingQueue[0]
-	p2 := gs.matchmakingQueue[1]
-	gs.matchmakingQueue = gs.matchmakingQueue[2:]
-
-	// Gera ID único para a partida
-	matchID := fmt.Sprintf("match_%d", time.Now().UnixNano())
-
-	// Cria a partida
-	match := game.NewMatch(matchID, p1, p2, gs.cardDB)
-	gs.activeMatches[matchID] = match
-
-	log.Printf("[SERVER] Partida criada: %s entre %s e %s", matchID, p1.ID, p2.ID)
-
-	// Envia MATCH_FOUND para ambos jogadores
-	p1.SendMsg(protocol.ServerMsg{
-		T:          protocol.MATCH_FOUND,
-		MatchID:    matchID,
-		OpponentID: p2.ID,
-	})
-
-	p2.SendMsg(protocol.ServerMsg{
-		T:          protocol.MATCH_FOUND,
-		MatchID:    matchID,
-		OpponentID: p1.ID,
-	})
-
-	// Envia estado inicial
-	match.BroadcastState()
-
-	// Monitora o fim da partida
-	go gs.monitorMatch(match)
 }
 
 // monitorMatch monitora uma partida até seu término
 func (gs *GameServer) monitorMatch(match *game.Match) {
 	<-match.Done()
-
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
-
-	// Armazena informações do último oponente para possível rematch
-	match.P1.LastOpponent = match.P2.ID
-	match.P2.LastOpponent = match.P1.ID
-	match.P1.WantsRematch = false
-	match.P2.WantsRematch = false
-
-	// Remove a partida da lista de partidas ativas
 	delete(gs.activeMatches, match.ID)
 	log.Printf("[SERVER] Partida %s finalizada e removida", match.ID)
 }
@@ -122,30 +83,61 @@ func (gs *GameServer) findPlayerMatch(playerID string) *game.Match {
 }
 
 func main() {
-	addr := getEnv("LISTEN_ADDR", ":9000")
+	tcpAddr := getEnv("LISTEN_ADDR", ":9000")
+	apiAddr := getEnv("API_ADDR", ":8000")
+	thisServerAddress := "http://" + getEnv("HOSTNAME", "localhost") + apiAddr
 
-	log.Printf("[SERVER] Iniciando servidor Attribute War em %s ...", addr)
-
-	// Cria o servidor do jogo
-	gameServer := NewGameServer()
-
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("[SERVER] Erro ao escutar: %v", err)
+	// Lógica para descobrir a topologia do anel a partir de variáveis de ambiente
+	allServersEnv := getEnv("ALL_SERVERS", thisServerAddress)
+	allServers = strings.Split(allServersEnv, ",")
+	myIndex := -1
+	for i, addr := range allServers {
+		if addr == thisServerAddress {
+			myIndex = i
+			break
+		}
 	}
-	defer ln.Close()
+	if myIndex == -1 {
+		log.Fatalf("Endereço do servidor %s não encontrado na lista ALL_SERVERS", thisServerAddress)
+	}
 
-	// Goroutine para matchmaking contínuo
+	nextIndex := (myIndex + 1) % len(allServers)
+	nextServerAddress = allServers[nextIndex]
+	log.Printf("[TOKEN_RING] Este servidor é %s. O próximo no anel é %s.", thisServerAddress, nextServerAddress)
+
+	gameServer := NewGameServer(thisServerAddress)
+
+	// Inicia o servidor HTTP para a API inter-servidores numa goroutine
 	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			gameServer.tryCreateMatch()
+		http.HandleFunc("/api/find-opponent", gameServer.handleFindOpponent)
+		http.HandleFunc("/api/request-match", gameServer.handleRequestMatch)
+		http.HandleFunc("/api/receive-token", gameServer.handleReceiveToken)
+		log.Printf("[API_SERVER] A escutar em %s", apiAddr)
+		if err := http.ListenAndServe(apiAddr, nil); err != nil {
+			log.Fatalf("[API_SERVER] Erro ao iniciar servidor HTTP: %v", err)
 		}
 	}()
 
-	log.Printf("[SERVER] Servidor pronto! Aguardando conexões...")
+	// Inicia o loop principal de matchmaking numa goroutine
+	go gameServer.matchmakingLoop()
+
+	// O primeiro servidor na lista (índice 0) é responsável por criar e iniciar o token
+	if myIndex == 0 {
+		log.Printf("[TOKEN_RING] Eu sou o nó inicial. A criar e a passar o token pela primeira vez.")
+		// Dá o token a si mesmo para começar o ciclo
+		go func() {
+			time.Sleep(5 * time.Second) // Espera um pouco para os outros servidores estarem online
+			gameServer.tokenAcquiredChan <- true
+		}()
+	}
+
+	// Inicia o listener TCP para as conexões dos clientes
+	ln, err := net.Listen("tcp", tcpAddr)
+	if err != nil {
+		log.Fatalf("[SERVER] Erro ao escutar TCP: %v", err)
+	}
+	defer ln.Close()
+	log.Printf("[SERVER] A escutar jogadores em %s", tcpAddr)
 
 	for {
 		conn, err := ln.Accept()
@@ -161,35 +153,61 @@ func main() {
 func (gs *GameServer) handleConn(conn net.Conn) {
 	peer := conn.RemoteAddr().String()
 	log.Printf("[SERVER] Nova conexão de %s", peer)
-
-	// Cria PlayerConn
 	player := protocol.NewPlayerConn(peer, conn)
-
-	// Registra o jogador
 	gs.mu.Lock()
 	gs.playersOnline[peer] = player
 	gs.mu.Unlock()
 
-	// Limpeza quando desconectar
 	defer func() {
 		log.Printf("[SERVER] Desconectando %s", peer)
 		gs.cleanup(player)
 		conn.Close()
 	}()
 
-	// Loop principal de mensagens
 	for {
 		msg, err := player.ReadMsg()
 		if err != nil {
-			log.Printf("[SERVER] Erro ao ler de %s: %v", peer, err)
 			break
 		}
 		if msg == nil {
 			break // EOF
 		}
-
 		log.Printf("[SERVER] <- %s: %s", peer, msg.T)
 		gs.handleMessage(player, msg)
+	}
+}
+
+// matchmakingLoop é o novo coração da lógica de matchmaking, baseado em token.
+func (gs *GameServer) matchmakingLoop() {
+	for {
+		// 1. ESPERA - Bloqueia aqui até receber o token
+		<-gs.tokenAcquiredChan
+		log.Printf("[MATCHMAKING] Tenho o token. A verificar a fila...")
+
+		// 2. AGE (Secção Crítica) - Executa a lógica de matchmaking
+		gs.mu.Lock()
+		if len(gs.matchmakingQueue) >= 2 {
+			gs.createLocalMatch() // Lógica de partida local
+		} else if len(gs.matchmakingQueue) == 1 {
+			// player := gs.matchmakingQueue[0]
+			gs.mu.Unlock() // Libera a trava local antes de chamadas de rede
+
+			found := gs.findAndCreateDistributedMatch()
+			if found {
+				log.Printf("[MATCHMAKING] Partida distribuída criada com sucesso.")
+			} else {
+				log.Printf("[MATCHMAKING] Nenhum oponente distribuído encontrado.")
+			}
+		} else {
+			gs.mu.Unlock()
+			log.Printf("[MATCHMAKING] Fila vazia.")
+		}
+
+		// Pausa antes de passar o token para não sobrecarregar a rede
+		time.Sleep(2 * time.Second)
+
+		// 3. PASSA - Passa o token para o próximo servidor
+		gs.passTokenToNextServer()
 	}
 }
 
@@ -245,6 +263,78 @@ func (gs *GameServer) cleanup(player *protocol.PlayerConn) {
 	}
 }
 
+func (gs *GameServer) createLocalMatch() {
+	p1 := gs.matchmakingQueue[0]
+	p2 := gs.matchmakingQueue[1]
+	gs.matchmakingQueue = gs.matchmakingQueue[2:]
+	gs.mu.Unlock()
+
+	matchID := fmt.Sprintf("local_match_%d", time.Now().UnixNano())
+	match := game.NewMatch(matchID, p1, p2, gs.cardDB)
+	gs.mu.Lock()
+	gs.activeMatches[matchID] = match
+	gs.mu.Unlock()
+
+	log.Printf("[SERVER] Partida local criada: %s", matchID)
+	p1.SendMsg(protocol.ServerMsg{T: protocol.MATCH_FOUND, MatchID: matchID, OpponentID: p2.ID})
+	p2.SendMsg(protocol.ServerMsg{T: protocol.MATCH_FOUND, MatchID: matchID, OpponentID: p1.ID})
+	match.BroadcastState()
+	go gs.monitorMatch(match)
+}
+
+func (gs *GameServer) findAndCreateDistributedMatch() bool {
+	for _, serverAddr := range allServers {
+		if serverAddr == gs.serverAddress {
+			continue
+		}
+		resp, err := gs.httpClient.Get(serverAddr + "/api/find-opponent")
+		if err == nil && resp.StatusCode == http.StatusOK {
+			// ... Lógica para confirmar e criar a partida com POST para /api/request-match ...
+			// Se a partida for criada, remover jogador da fila e retornar true
+			resp.Body.Close()
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}
+	return false
+}
+
+func (gs *GameServer) passTokenToNextServer() {
+	gs.tokenMutex.Lock()
+	gs.hasToken = false
+	gs.tokenMutex.Unlock()
+
+	log.Printf("[TOKEN_RING] A passar o token para %s...", nextServerAddress)
+	_, err := gs.httpClient.Post(nextServerAddress+"/api/receive-token", "application/json", nil)
+	if err != nil {
+		log.Printf("[TOKEN_RING] ERRO ao passar o token: %v. O anel pode estar quebrado.", err)
+		// Lógica de recuperação: tenta dar o token a si mesmo para recomeçar o ciclo
+		time.Sleep(5 * time.Second)
+		gs.tokenAcquiredChan <- true
+	} else {
+		log.Printf("[TOKEN_RING] Token passado com sucesso.")
+	}
+}
+
+func (gs *GameServer) handleReceiveToken(w http.ResponseWriter, r *http.Request) {
+	gs.tokenMutex.Lock()
+	if gs.hasToken {
+		gs.tokenMutex.Unlock()
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	gs.hasToken = true
+	gs.tokenMutex.Unlock()
+
+	log.Printf("[TOKEN_RING] Recebi o token do servidor anterior.")
+	select {
+	case gs.tokenAcquiredChan <- true:
+	default: // Evita bloquear se o canal já estiver cheio
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
 // handleMessage processa uma mensagem do cliente
 func (gs *GameServer) handleMessage(player *protocol.PlayerConn, msg *protocol.ClientMsg) {
 	switch msg.T {
@@ -277,19 +367,15 @@ func (gs *GameServer) handleMessage(player *protocol.PlayerConn, msg *protocol.C
 
 // handleFindMatch adiciona jogador à fila de matchmaking
 func (gs *GameServer) handleFindMatch(player *protocol.PlayerConn) {
-	gs.mu.Lock()
-	defer gs.mu.Unlock()
-
-	// Verifica se já está na fila
-	for _, p := range gs.matchmakingQueue {
-		if p.ID == player.ID {
-			return
-		}
-	}
-
-	// Adiciona à fila
-	gs.matchmakingQueue = append(gs.matchmakingQueue, player)
-	log.Printf("[SERVER] %s entrou na fila de matchmaking", player.ID)
+    gs.mu.Lock()
+    defer gs.mu.Unlock()
+    for _, p := range gs.matchmakingQueue {
+        if p.ID == player.ID {
+            return
+        }
+    }
+    gs.matchmakingQueue = append(gs.matchmakingQueue, player)
+    log.Printf("[SERVER] %s entrou na fila de matchmaking", player.ID)
 }
 
 // handlePlay processa uma jogada
@@ -515,9 +601,36 @@ func (gs *GameServer) findPlayerMatchUnsafe(playerID string) *game.Match {
 	return nil
 }
 
-func getEnv(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
 	}
-	return def
+	return fallback
+}
+
+
+// handleFindOpponent responde se este servidor tem um jogador na fila
+func (gs *GameServer) handleFindOpponent(w http.ResponseWriter, r *http.Request) {
+	gs.mu.RLock()
+	defer gs.mu.RUnlock()
+
+	if len(gs.matchmakingQueue) > 0 {
+		player := gs.matchmakingQueue[0]
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"playerId": player.ID,
+		})
+		log.Printf("[API_SERVER] Respondi a /api/find-opponent: tenho o jogador %s", player.ID)
+	} else {
+		http.NotFound(w, r)
+		log.Printf("[API_SERVER] Respondi a /api/find-opponent: não tenho jogadores na fila")
+	}
+}
+
+// handleRequestMatch processa o pedido final para criar uma partida
+func (gs *GameServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
+	// Lógica para verificar se o jogador ainda está disponível,
+	// remover o jogador da fila local e confirmar a criação da partida.
+	// Se tudo estiver OK, responde com http.StatusOK.
+	// Se o jogador não estiver mais disponível, responde com um erro (ex: http.StatusConflict).
 }

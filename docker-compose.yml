@@ -1,28 +1,94 @@
+version: '3.8'
+
 services:
-  server:
+  # --- Serviço Redis para Exclusão Mútua ---
+  redis:
+    image: "redis:alpine"
+    container_name: pbl_redis
+    networks:
+      - game-net
+    ports:
+      - "6379:6379"
+
+  # --- Cluster de Servidores do Jogo ---
+  server-1:
     build:
       context: .
       dockerfile: server/Dockerfile
     image: pingpong-server:latest
-    container_name: pbl_server
+    container_name: pbl_server_1
+    networks:
+      - game-net
     ports:
-      - "9000:9000"  
-    healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 9000 || exit 1"]
-      interval: 5s
-      timeout: 2s
-      retries: 10
+      - "9000:9000" # Porta TCP para clientes
+      - "8000:8000" # Porta HTTP para API inter-servidores
+    environment:
+      - LISTEN_ADDR=:9000
+      - API_ADDR=:8000
+      - REDIS_ADDR=redis:6379
+      - OTHER_SERVERS=http://server-2:8001,http://server-3:8002
+    depends_on:
+      - redis
 
+  server-2:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: pingpong-server:latest
+    container_name: pbl_server_2
+    networks:
+      - game-net
+    ports:
+      - "9001:9000"
+      - "8001:8001"
+    environment:
+      - LISTEN_ADDR=:9000
+      - API_ADDR=:8001
+      - REDIS_ADDR=redis:6379
+      - OTHER_SERVERS=http://server-1:8000,http://server-3:8002
+    depends_on:
+      - redis
+
+  server-3:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: pingpong-server:latest
+    container_name: pbl_server_3
+    networks:
+      - game-net
+    ports:
+      - "9002:9000"
+      - "8002:8002"
+    environment:
+      - LISTEN_ADDR=:9000
+      - API_ADDR=:8002
+      - REDIS_ADDR=redis:6379
+      - OTHER_SERVERS=http://server-1:8000,http://server-2:8001
+    depends_on:
+      - redis
+
+  # --- Serviço de Cliente para Testes ---
+  # Pode escalar este serviço para ter múltiplos clientes
   client:
     build:
       context: .
       dockerfile: client/Dockerfile
     image: pingpong-client:latest
-    stdin_open: true  
-    tty: true         
+    stdin_open: true
+    tty: true
+    networks:
+      - game-net
     environment:
-      SERVER_ADDR: "server:9000"
+      # O cliente conecta-se ao server-1 através da rede interna do Docker
+      SERVER_ADDR: "server-1:9000" 
       PING_INTERVAL_MS: "2000"
     depends_on:
-      server:
-        condition: service_healthy
+      # O cliente só inicia depois que o server-1 estiver pronto.
+      # Removido o healthcheck para simplificar, mas pode ser adicionado de volta.
+      - server-1
+
+# Define a rede personalizada que permite a comunicação entre os serviços
+networks:
+  game-net:
+    driver: bridge
