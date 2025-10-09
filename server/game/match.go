@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand"
 	"pingpong/server/protocol"
+	"pingpong/server/pubsub"
 	"sync"
 	"time"
 )
@@ -24,10 +25,11 @@ type Match struct {
 	CardDB   *CardDB
 	mu       sync.Mutex
 	done     chan bool
+	broker   *pubsub.Broker
 }
 
 // NewMatch cria uma nova partida
-func NewMatch(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB) *Match {
+func NewMatch(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pubsub.Broker) *Match {
 	match := &Match{
 		ID:      id,
 		P1:      p1,
@@ -40,6 +42,7 @@ func NewMatch(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB) *Match {
 		Waiting: make(map[string]string),
 		CardDB:  cardDB,
 		done:    make(chan bool, 1),
+		broker:  broker,
 	}
 
 	// Gera mãos iniciais
@@ -281,8 +284,8 @@ func (m *Match) broadcastRoundResult(p1Card, p2Card Card, p1Bonus, p2Bonus, p1Dm
 		Logs: p2Logs,
 	}
 
-	m.P1.SendMsg(p1Msg)
-	m.P2.SendMsg(p2Msg)
+	m.sendToPlayer(m.P1.ID, p1Msg)
+	m.sendToPlayer(m.P2.ID, p2Msg)
 }
 
 // BroadcastState envia o estado atual para ambos jogadores
@@ -326,8 +329,8 @@ func (m *Match) BroadcastState() {
 		DeadlineMs: deadlineMs,
 	}
 
-	m.P1.SendMsg(p1Msg)
-	m.P2.SendMsg(p2Msg)
+	m.sendToPlayer(m.P1.ID, p1Msg)
+	m.sendToPlayer(m.P2.ID, p2Msg)
 }
 
 // EndIfGameOver verifica se o jogo terminou e envia MATCH_END
@@ -352,8 +355,8 @@ func (m *Match) EndIfGameOver() bool {
 		}
 
 		// Envia resultado final
-		m.P1.SendMsg(protocol.ServerMsg{T: protocol.MATCH_END, Result: p1Result})
-		m.P2.SendMsg(protocol.ServerMsg{T: protocol.MATCH_END, Result: p2Result})
+		m.sendToPlayer(m.P1.ID, protocol.ServerMsg{T: protocol.MATCH_END, Result: p1Result})
+		m.sendToPlayer(m.P2.ID, protocol.ServerMsg{T: protocol.MATCH_END, Result: p2Result})
 
 		log.Printf("[MATCH %s] Partida finalizada. P1(%s): %s, P2(%s): %s",
 			m.ID, m.P1.ID, p1Result, m.P2.ID, p2Result)
@@ -367,6 +370,11 @@ func (m *Match) EndIfGameOver() bool {
 		return true
 	}
 	return false
+}
+
+// sendToPlayer envia uma mensagem para um jogador específico via pub/sub
+func (m *Match) sendToPlayer(playerID string, msg protocol.ServerMsg) {
+	m.broker.Publish(fmt.Sprintf("player.%s", playerID), msg)
 }
 
 // scheduleAutoPlay agenda o auto-play se necessário

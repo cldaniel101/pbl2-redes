@@ -7,6 +7,7 @@ import (
 	"os"
 	"pingpong/server/game"
 	"pingpong/server/protocol"
+	"pingpong/server/pubsub"
 	"sync"
 	"time"
 )
@@ -19,6 +20,7 @@ type GameServer struct {
 	matchmakingQueue []*protocol.PlayerConn
 	activeMatches    map[string]*game.Match
 	mu               sync.RWMutex
+	broker           *pubsub.Broker
 }
 
 // NewGameServer cria um novo servidor do jogo
@@ -43,6 +45,7 @@ func NewGameServer() *GameServer {
 		playersOnline:    make(map[string]*protocol.PlayerConn),
 		matchmakingQueue: make([]*protocol.PlayerConn, 0),
 		activeMatches:    make(map[string]*game.Match),
+		broker:           pubsub.NewBroker(),
 	}
 }
 
@@ -65,19 +68,19 @@ func (gs *GameServer) tryCreateMatch() {
 	matchID := fmt.Sprintf("match_%d", time.Now().UnixNano())
 
 	// Cria a partida
-	match := game.NewMatch(matchID, p1, p2, gs.cardDB)
+	match := game.NewMatch(matchID, p1, p2, gs.cardDB, gs.broker)
 	gs.activeMatches[matchID] = match
 
 	log.Printf("[SERVER] Partida criada: %s entre %s e %s", matchID, p1.ID, p2.ID)
 
 	// Envia MATCH_FOUND para ambos jogadores
-	p1.SendMsg(protocol.ServerMsg{
+	gs.sendToPlayer(p1.ID, protocol.ServerMsg{
 		T:          protocol.MATCH_FOUND,
 		MatchID:    matchID,
 		OpponentID: p2.ID,
 	})
 
-	p2.SendMsg(protocol.ServerMsg{
+	gs.sendToPlayer(p2.ID, protocol.ServerMsg{
 		T:          protocol.MATCH_FOUND,
 		MatchID:    matchID,
 		OpponentID: p1.ID,
@@ -145,6 +148,9 @@ func main() {
 		}
 	}()
 
+	// Goroutine para processar mensagens de clientes
+	go gameServer.listenForClientMessages()
+
 	log.Printf("[SERVER] Servidor pronto! Aguardando conexões...")
 
 	for {
@@ -162,22 +168,26 @@ func (gs *GameServer) handleConn(conn net.Conn) {
 	peer := conn.RemoteAddr().String()
 	log.Printf("[SERVER] Nova conexão de %s", peer)
 
-	// Cria PlayerConn
 	player := protocol.NewPlayerConn(peer, conn)
 
-	// Registra o jogador
 	gs.mu.Lock()
 	gs.playersOnline[peer] = player
 	gs.mu.Unlock()
 
-	// Limpeza quando desconectar
+	// Cria um subscriber para este jogador
+	playerSub := gs.broker.Subscribe(fmt.Sprintf("player.%s", player.ID))
+
+	// Goroutine para enviar mensagens para o cliente
+	go gs.writeLoop(player, playerSub)
+
 	defer func() {
 		log.Printf("[SERVER] Desconectando %s", peer)
+		gs.broker.Unsubscribe(playerSub)
 		gs.cleanup(player)
 		conn.Close()
 	}()
 
-	// Loop principal de mensagens
+	// Loop para ler mensagens do cliente e publicá-las
 	for {
 		msg, err := player.ReadMsg()
 		if err != nil {
@@ -188,8 +198,33 @@ func (gs *GameServer) handleConn(conn net.Conn) {
 			break // EOF
 		}
 
-		log.Printf("[SERVER] <- %s: %s", peer, msg.T)
-		gs.handleMessage(player, msg)
+		// Publica a mensagem do cliente para ser processada
+		gs.broker.Publish("client.messages", protocol.ClientAction{Player: player, Msg: msg})
+	}
+}
+
+// listenForClientMessages escuta e processa mensagens de clientes do broker
+func (gs *GameServer) listenForClientMessages() {
+	sub := gs.broker.Subscribe("client.messages")
+	for msg := range sub {
+		if action, ok := msg.Payload.(protocol.ClientAction); ok {
+			log.Printf("[SERVER] <- %s: %s", action.Player.ID, action.Msg.T)
+			gs.handleMessage(action.Player, action.Msg)
+		}
+	}
+}
+
+// sendToPlayer envia uma mensagem para um jogador específico via pub/sub
+func (gs *GameServer) sendToPlayer(playerID string, msg protocol.ServerMsg) {
+	gs.broker.Publish(fmt.Sprintf("player.%s", playerID), msg)
+}
+
+// writeLoop envia mensagens de um subscriber para o PlayerConn
+func (gs *GameServer) writeLoop(player *protocol.PlayerConn, sub pubsub.Subscriber) {
+	for msg := range sub {
+		if serverMsg, ok := msg.Payload.(protocol.ServerMsg); ok {
+			player.SendMsg(serverMsg)
+		}
 	}
 }
 
@@ -227,12 +262,12 @@ func (gs *GameServer) cleanup(player *protocol.PlayerConn) {
 			}
 
 			if opponent != nil {
-				opponent.SendMsg(protocol.ServerMsg{
+				gs.sendToPlayer(opponent.ID, protocol.ServerMsg{
 					T:    protocol.ERROR,
 					Code: "OPPONENT_DISCONNECTED",
 					Msg:  "Seu oponente desconectou",
 				})
-				opponent.SendMsg(protocol.ServerMsg{
+				gs.sendToPlayer(opponent.ID, protocol.ServerMsg{
 					T:      protocol.MATCH_END,
 					Result: protocol.WIN,
 				})
@@ -267,7 +302,7 @@ func (gs *GameServer) handleMessage(player *protocol.PlayerConn, msg *protocol.C
 	case protocol.REMATCH:
 		gs.handleRematch(player)
 	default:
-		player.SendMsg(protocol.ServerMsg{
+		gs.sendToPlayer(player.ID, protocol.ServerMsg{
 			T:    protocol.ERROR,
 			Code: protocol.INVALID_MESSAGE,
 			Msg:  "Tipo de mensagem desconhecido",
@@ -296,7 +331,7 @@ func (gs *GameServer) handleFindMatch(player *protocol.PlayerConn) {
 func (gs *GameServer) handlePlay(player *protocol.PlayerConn, cardID string) {
 	match := gs.findPlayerMatch(player.ID)
 	if match == nil {
-		player.SendMsg(protocol.ServerMsg{
+		gs.sendToPlayer(player.ID, protocol.ServerMsg{
 			T:    protocol.ERROR,
 			Code: protocol.MATCH_NOT_FOUND,
 			Msg:  "Você não está em uma partida",
@@ -305,7 +340,7 @@ func (gs *GameServer) handlePlay(player *protocol.PlayerConn, cardID string) {
 	}
 
 	if err := match.PlayCard(player.ID, cardID); err != nil {
-		player.SendMsg(protocol.ServerMsg{
+		gs.sendToPlayer(player.ID, protocol.ServerMsg{
 			T:    protocol.ERROR,
 			Code: protocol.INVALID_CARD,
 			Msg:  err.Error(),
@@ -332,7 +367,7 @@ func (gs *GameServer) handleChat(player *protocol.PlayerConn, text string) {
 
 	if opponent != nil {
 		// Envia mensagem de chat para o oponente
-		opponent.SendMsg(protocol.ServerMsg{
+		gs.sendToPlayer(opponent.ID, protocol.ServerMsg{
 			T:        protocol.CHAT_MESSAGE,
 			SenderID: player.ID,
 			Text:     text,
@@ -346,7 +381,7 @@ func (gs *GameServer) handlePing(player *protocol.PlayerConn, ts int64) {
 	player.LastPing = time.Now().UnixMilli()
 	rtt := player.LastPing - ts
 
-	player.SendMsg(protocol.ServerMsg{
+	gs.sendToPlayer(player.ID, protocol.ServerMsg{
 		T:     protocol.PONG,
 		TS:    ts,
 		RTTMs: rtt,
@@ -357,7 +392,7 @@ func (gs *GameServer) handlePing(player *protocol.PlayerConn, ts int64) {
 func (gs *GameServer) handleOpenPack(player *protocol.PlayerConn) {
 	cards, err := gs.packSystem.OpenPack(player.ID)
 	if err != nil {
-		player.SendMsg(protocol.ServerMsg{
+		gs.sendToPlayer(player.ID, protocol.ServerMsg{
 			T:    protocol.ERROR,
 			Code: protocol.OUT_OF_STOCK,
 			Msg:  err.Error(),
@@ -365,7 +400,7 @@ func (gs *GameServer) handleOpenPack(player *protocol.PlayerConn) {
 		return
 	}
 
-	player.SendMsg(protocol.ServerMsg{
+	gs.sendToPlayer(player.ID, protocol.ServerMsg{
 		T:     protocol.PACK_OPENED,
 		Cards: cards,
 		Stock: gs.packSystem.GetStock(),
@@ -384,14 +419,14 @@ func (gs *GameServer) handleAutoPlay(player *protocol.PlayerConn, enable bool) {
 	player.AutoPlay = enable
 
 	if enable {
-		player.SendMsg(protocol.ServerMsg{
+		gs.sendToPlayer(player.ID, protocol.ServerMsg{
 			T:    protocol.ERROR,
 			Code: "AUTOPLAY_ENABLED",
 			Msg:  "Autoplay ativado - cartas serão jogadas automaticamente se não escolher em 12 segundos",
 		})
 		log.Printf("[SERVER] %s ativou autoplay", player.ID)
 	} else {
-		player.SendMsg(protocol.ServerMsg{
+		gs.sendToPlayer(player.ID, protocol.ServerMsg{
 			T:    protocol.ERROR,
 			Code: "AUTOPLAY_DISABLED",
 			Msg:  "Autoplay desativado - você tem tempo ilimitado para jogar",
@@ -407,7 +442,7 @@ func (gs *GameServer) handleRematch(player *protocol.PlayerConn) {
 
 	// Verifica se o jogador tem um último oponente
 	if player.LastOpponent == "" {
-		player.SendMsg(protocol.ServerMsg{
+		gs.sendToPlayer(player.ID, protocol.ServerMsg{
 			T:    protocol.ERROR,
 			Code: "NO_LAST_OPPONENT",
 			Msg:  "Você precisa terminar uma partida antes de solicitar rematch",
@@ -417,7 +452,7 @@ func (gs *GameServer) handleRematch(player *protocol.PlayerConn) {
 
 	// Verifica se já está em uma partida
 	if gs.findPlayerMatchUnsafe(player.ID) != nil {
-		player.SendMsg(protocol.ServerMsg{
+		gs.sendToPlayer(player.ID, protocol.ServerMsg{
 			T:    protocol.ERROR,
 			Code: "ALREADY_IN_MATCH",
 			Msg:  "Você já está em uma partida",
@@ -435,7 +470,7 @@ func (gs *GameServer) handleRematch(player *protocol.PlayerConn) {
 	}
 
 	if opponent == nil {
-		player.SendMsg(protocol.ServerMsg{
+		gs.sendToPlayer(player.ID, protocol.ServerMsg{
 			T:    protocol.ERROR,
 			Code: "OPPONENT_NOT_ONLINE",
 			Msg:  "Seu último oponente não está online",
@@ -447,13 +482,13 @@ func (gs *GameServer) handleRematch(player *protocol.PlayerConn) {
 	player.WantsRematch = true
 
 	// Notifica o oponente sobre a solicitação
-	opponent.SendMsg(protocol.ServerMsg{
+	gs.sendToPlayer(opponent.ID, protocol.ServerMsg{
 		T:        protocol.REMATCH_REQUEST,
 		SenderID: player.ID,
 		Msg:      fmt.Sprintf("%s quer jogar novamente! Digite /rematch para aceitar.", player.ID),
 	})
 
-	player.SendMsg(protocol.ServerMsg{
+	gs.sendToPlayer(player.ID, protocol.ServerMsg{
 		T:    protocol.ERROR,
 		Code: "REMATCH_REQUESTED",
 		Msg:  "Solicitação de rematch enviada! Aguardando resposta do oponente...",
@@ -474,7 +509,7 @@ func (gs *GameServer) createRematch(p1, p2 *protocol.PlayerConn) {
 	matchID := fmt.Sprintf("rematch_%d", time.Now().UnixNano())
 
 	// Cria a partida
-	match := game.NewMatch(matchID, p1, p2, gs.cardDB)
+	match := game.NewMatch(matchID, p1, p2, gs.cardDB, gs.broker)
 	gs.activeMatches[matchID] = match
 
 	// Reseta estados de rematch
@@ -484,14 +519,14 @@ func (gs *GameServer) createRematch(p1, p2 *protocol.PlayerConn) {
 	log.Printf("[SERVER] Rematch criado: %s entre %s e %s", matchID, p1.ID, p2.ID)
 
 	// Envia confirmação de rematch aceito
-	p1.SendMsg(protocol.ServerMsg{
+	gs.sendToPlayer(p1.ID, protocol.ServerMsg{
 		T:          protocol.REMATCH_ACCEPTED,
 		MatchID:    matchID,
 		OpponentID: p2.ID,
 		Msg:        "Rematch aceito! Nova partida iniciada!",
 	})
 
-	p2.SendMsg(protocol.ServerMsg{
+	gs.sendToPlayer(p2.ID, protocol.ServerMsg{
 		T:          protocol.REMATCH_ACCEPTED,
 		MatchID:    matchID,
 		OpponentID: p1.ID,

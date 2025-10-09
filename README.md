@@ -49,18 +49,18 @@ Para interagir com a aplicação, você pode se conectar a uma sessão interativ
    ```bash
    docker ps
    ```
-   A saída mostrará os nomes dos contêineres, como `pbl1-redes-client-1` e `pbl1-redes-client-2`.
+   A saída mostrará os nomes dos contêineres, como `pbl2-redes-client-1` e `pbl2-redes-client-2`.
 
 2. **Abra dois terminais.**
 
 3. **No primeiro terminal**, conecte-se ao primeiro cliente:
    ```bash
-   docker attach pbl1-redes-client-1
+   docker attach pbl2-redes-client-1
    ```
 
 4. **No segundo terminal**, conecte-se ao segundo cliente:
    ```bash
-   docker attach pbl1-redes-client-2
+   docker attach pbl2-redes-client-2
    ```
 
 5. **Agora você pode**:
@@ -165,7 +165,7 @@ Agora você precisa de um terminal para cada jogador.
     docker ps
 
     # Depois, conecte-se a ele (o nome pode variar)
-    docker attach pbl1-redes-main-client-1
+    docker attach pbl2-redes-main-client-1
     ```
 
 Agora você pode jogar uma carta em cada terminal e verá a partida progredir.

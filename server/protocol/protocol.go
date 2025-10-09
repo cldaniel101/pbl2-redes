@@ -37,6 +37,12 @@ type ServerMsg struct {
 	Text     string `json:"text,omitempty"`
 }
 
+// ClientAction é uma estrutura para encapsular a mensagem do cliente e quem a enviou
+type ClientAction struct {
+	Player *PlayerConn
+	Msg    *ClientMsg
+}
+
 // PlayerView representa a visão de um jogador no estado da partida
 type PlayerView struct {
 	HP           int      `json:"hp"`
