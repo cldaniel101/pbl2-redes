@@ -1,15 +1,6 @@
 version: '3.8'
 
 services:
-  # --- Serviço Redis para Exclusão Mútua ---
-  redis:
-    image: "redis:alpine"
-    container_name: pbl_redis
-    networks:
-      - game-net
-    ports:
-      - "6379:6379"
-
   # --- Cluster de Servidores do Jogo ---
   server-1:
     build:
@@ -25,10 +16,7 @@ services:
     environment:
       - LISTEN_ADDR=:9000
       - API_ADDR=:8000
-      - REDIS_ADDR=redis:6379
       - OTHER_SERVERS=http://server-2:8001,http://server-3:8002
-    depends_on:
-      - redis
 
   server-2:
     build:
@@ -44,10 +32,7 @@ services:
     environment:
       - LISTEN_ADDR=:9000
       - API_ADDR=:8001
-      - REDIS_ADDR=redis:6379
       - OTHER_SERVERS=http://server-1:8000,http://server-3:8002
-    depends_on:
-      - redis
 
   server-3:
     build:
@@ -63,10 +48,7 @@ services:
     environment:
       - LISTEN_ADDR=:9000
       - API_ADDR=:8002
-      - REDIS_ADDR=redis:6379
       - OTHER_SERVERS=http://server-1:8000,http://server-2:8001
-    depends_on:
-      - redis
 
   # --- Serviço de Cliente para Testes ---
   # Pode escalar este serviço para ter múltiplos clientes
