@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"net"
+	"net/http"
 )
 
 // Mensagens do Cliente para o Servidor
@@ -103,6 +104,11 @@ type PlayerConn struct {
 	AutoPlay     bool
 	WantsRematch bool
 	LastOpponent string
+
+	// --- NOVOS CAMPOS PARA JOGADORES REMOTOS ---
+	IsRemote        bool   // Sinaliza se este jogador é um proxy para um jogador em outro servidor
+	RemoteServerURL string // URL do servidor host ou proxy
+	HttpClient      *http.Client // Cliente HTTP para comunicação entre servidores
 }
 
 // NewPlayerConn cria uma nova conexão de jogador

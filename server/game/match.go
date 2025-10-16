@@ -7,6 +7,8 @@ import (
 	"pingpong/server/protocol"
 	"sync"
 	"time"
+	"encoding/json"
+	"strings"
 )
 
 // Match representa uma partida 1v1
@@ -435,4 +437,35 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+
+func sendMsgToPlayer(player *protocol.PlayerConn, msg protocol.ServerMsg) {
+    if player.IsRemote {
+        // Envia a mensagem para o servidor proxy via API REST
+        msgBytes, err := json.Marshal(msg)
+        if err != nil {
+            log.Printf("[MATCH] Erro ao codificar msg para jogador remoto %s: %v", player.ID, err)
+            return
+        }
+
+        forwardURL := player.RemoteServerURL + "/api/forward"
+        
+        // Adiciona o ID do jogador alvo no corpo da requisição
+        payload := map[string]interface{}{
+            "targetPlayerId": player.ID,
+            "message":        string(msgBytes),
+        }
+        payloadBytes, _ := json.Marshal(payload)
+        
+        resp, err := player.HttpClient.Post(forwardURL, "application/json", strings.NewReader(string(payloadBytes)))
+        if err != nil {
+            log.Printf("[MATCH] Erro ao encaminhar msg para jogador remoto %s: %v", player.ID, err)
+        } else {
+            resp.Body.Close()
+        }
+    } else {
+        // Jogador local, envia via TCP
+        player.SendMsg(msg)
+    }
 }

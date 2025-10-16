@@ -20,6 +20,18 @@ var (
 	nextServerAddress string
 )
 
+// FindOpponentResponse é a resposta do endpoint /api/find-opponent
+type FindOpponentResponse struct {
+	PlayerID      string `json:"playerId"`
+	ServerAddress string `json:"serverAddress"` // O endereço do servidor que tem o oponente
+}
+
+// RequestMatchPayload é o corpo da requisição para /api/request-match
+type RequestMatchPayload struct {
+	RequestingPlayerID string `json:"requestingPlayerId"`
+	RequestingServer   string `json:"requestingServer"`
+}
+
 // GameServer modificado para a lógica de token ring
 type GameServer struct {
 	// Atributos de estado local e comunicação com clientes
@@ -36,6 +48,7 @@ type GameServer struct {
 	tokenMutex        sync.Mutex
 	hasToken          bool
 	tokenAcquiredChan chan bool // Canal para sinalizar que o token foi recebido
+	remoteMatches map[string]string
 }
 
 // NewGameServer cria um novo servidor de jogo.
@@ -57,6 +70,7 @@ func NewGameServer(serverAddress string) *GameServer {
 		httpClient:        &http.Client{Timeout: 5 * time.Second},
 		serverAddress:     serverAddress,
 		tokenAcquiredChan: make(chan bool, 1), // Canal com buffer para não bloquear
+		remoteMatches: make(map[string]string),
 	}
 }
 
@@ -112,6 +126,8 @@ func main() {
 		http.HandleFunc("/api/find-opponent", gameServer.handleFindOpponent)
 		http.HandleFunc("/api/request-match", gameServer.handleRequestMatch)
 		http.HandleFunc("/api/receive-token", gameServer.handleReceiveToken)
+		http.HandleFunc("/api/match/action", gameServer.handleMatchAction) // Proxy -> Host
+		http.HandleFunc("/api/forward", gameServer.handleForwardMessage)  // Host -> Proxy
 		log.Printf("[API_SERVER] A escutar em %s", apiAddr)
 		if err := http.ListenAndServe(apiAddr, nil); err != nil {
 			log.Fatalf("[API_SERVER] Erro ao iniciar servidor HTTP: %v", err)
@@ -163,9 +179,9 @@ func (gs *GameServer) handleConn(conn net.Conn) {
 		gs.cleanup(player)
 		conn.Close()
 	}()
-
-	for {
-		msg, err := player.ReadMsg()
+	
+	 for {
+        msg, err := player.ReadMsg()
 		if err != nil {
 			break
 		}
@@ -173,8 +189,25 @@ func (gs *GameServer) handleConn(conn net.Conn) {
 			break // EOF
 		}
 		log.Printf("[SERVER] <- %s: %s", peer, msg.T)
-		gs.handleMessage(player, msg)
-	}
+        gs.mu.RLock()
+        hostURL, isRemote := gs.remoteMatches[player.ID]
+        gs.mu.RUnlock()
+
+        if isRemote {
+            // JOGADOR EM PARTIDA REMOTA: Encaminhar mensagem via API
+            msgBytes, _ := json.Marshal(msg)
+            payload := map[string]string{
+                "playerId": player.ID,
+                "message":  string(msgBytes),
+            }
+            payloadBytes, _ := json.Marshal(payload)
+            
+            gs.httpClient.Post(hostURL+"/api/match/action", "application/json", strings.NewReader(string(payloadBytes)))
+        } else {
+            // JOGADOR LOCAL: Processar mensagem normalmente
+            gs.handleMessage(player, msg)
+        }
+    }
 }
 
 // matchmakingLoop é o novo coração da lógica de matchmaking, baseado em token.
@@ -282,22 +315,95 @@ func (gs *GameServer) createLocalMatch() {
 	go gs.monitorMatch(match)
 }
 
+// Substitua a função findAndCreateDistributedMatch em server/main.go por esta
+
 func (gs *GameServer) findAndCreateDistributedMatch() bool {
-	for _, serverAddr := range allServers {
-		if serverAddr == gs.serverAddress {
-			continue
-		}
-		resp, err := gs.httpClient.Get(serverAddr + "/api/find-opponent")
-		if err == nil && resp.StatusCode == http.StatusOK {
-			// ... Lógica para confirmar e criar a partida com POST para /api/request-match ...
-			// Se a partida for criada, remover jogador da fila e retornar true
-			resp.Body.Close()
-		}
-		if resp != nil {
-			resp.Body.Close()
-		}
-	}
-	return false
+    gs.mu.Lock()
+    if len(gs.matchmakingQueue) == 0 {
+        gs.mu.Unlock()
+        return false
+    }
+    player := gs.matchmakingQueue[0]
+    gs.mu.Unlock()
+
+    log.Printf("[MATCHMAKING] Jogador %s está procurando oponente em outros servidores...", player.ID)
+
+    for _, serverAddr := range allServers {
+        if serverAddr == gs.serverAddress {
+            continue
+        }
+
+        // 1. Encontra um oponente
+        findURL := serverAddr + "/api/find-opponent"
+        resp, err := gs.httpClient.Get(findURL)
+        if err != nil || resp.StatusCode != http.StatusOK {
+            if resp != nil {
+                resp.Body.Close()
+            }
+            continue
+        }
+
+        var opponent FindOpponentResponse
+        if err := json.NewDecoder(resp.Body).Decode(&opponent); err != nil {
+            resp.Body.Close()
+            continue
+        }
+        resp.Body.Close()
+
+        log.Printf("[MATCHMAKING] Oponente %s encontrado no servidor %s. Tentando iniciar partida...",
+            opponent.PlayerID, opponent.ServerAddress)
+
+        // 2. Confirma a partida com um POST
+        requestURL := opponent.ServerAddress + "/api/request-match"
+        payload := RequestMatchPayload{
+            RequestingPlayerID: player.ID,
+            RequestingServer:   gs.serverAddress,
+        }
+        body, _ := json.Marshal(payload)
+        
+        postResp, err := gs.httpClient.Post(requestURL, "application/json", strings.NewReader(string(body)))
+        if err == nil && postResp.StatusCode == http.StatusOK {
+			// Em server/main.go, dentro de findAndCreateDistributedMatch, após o POST ser bem-sucedido:
+
+			// ... dentro do `if err == nil && postResp.StatusCode == http.StatusOK`
+			postResp.Body.Close()
+
+			// O servidor que inicia a requisição se torna o host da partida.
+			gs.mu.Lock()
+			p1 := gs.matchmakingQueue[0]
+			gs.matchmakingQueue = gs.matchmakingQueue[1:]
+			gs.mu.Unlock()
+
+			// Cria um PlayerConn "proxy" para o jogador remoto
+			p2_remote := &protocol.PlayerConn{
+				ID:              opponent.PlayerID,
+				IsRemote:        true,
+				RemoteServerURL: opponent.ServerAddress,
+				HttpClient:      gs.httpClient,
+			}
+
+			matchID := fmt.Sprintf("dist_match_%d", time.Now().UnixNano())
+			match := game.NewMatch(matchID, p1, p2_remote, gs.cardDB)
+
+			gs.mu.Lock()
+			gs.activeMatches[matchID] = match
+			gs.mu.Unlock()
+
+			log.Printf("[SERVER] Partida distribuída %s criada. Host: local %s, Remoto: %s", matchID, p1.ID, p2_remote.ID)
+
+			// Notifica ambos os jogadores
+			p1.SendMsg(protocol.ServerMsg{T: protocol.MATCH_FOUND, MatchID: matchID, OpponentID: p2_remote.ID})
+			match.BroadcastState()
+			go gs.monitorMatch(match)
+
+			return true
+        }
+        if postResp != nil {
+            postResp.Body.Close()
+        }
+    }
+
+    return false
 }
 
 func (gs *GameServer) passTokenToNextServer() {
@@ -609,28 +715,140 @@ func getEnv(key, fallback string) string {
 }
 
 
-// handleFindOpponent responde se este servidor tem um jogador na fila
-func (gs *GameServer) handleFindOpponent(w http.ResponseWriter, r *http.Request) {
-	gs.mu.RLock()
-	defer gs.mu.RUnlock()
+// Substitua a função handleFindOpponent em server/main.go por esta
 
-	if len(gs.matchmakingQueue) > 0 {
-		player := gs.matchmakingQueue[0]
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"playerId": player.ID,
-		})
-		log.Printf("[API_SERVER] Respondi a /api/find-opponent: tenho o jogador %s", player.ID)
-	} else {
-		http.NotFound(w, r)
-		log.Printf("[API_SERVER] Respondi a /api/find-opponent: não tenho jogadores na fila")
-	}
+func (gs *GameServer) handleFindOpponent(w http.ResponseWriter, r *http.Request) {
+    gs.mu.RLock()
+    defer gs.mu.RUnlock()
+
+    if len(gs.matchmakingQueue) > 0 {
+        player := gs.matchmakingQueue[0]
+        response := FindOpponentResponse{
+            PlayerID:      player.ID,
+            ServerAddress: gs.serverAddress,
+        }
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(response)
+        log.Printf("[API_SERVER] Respondi a /api/find-opponent: tenho o jogador %s", player.ID)
+    } else {
+        http.NotFound(w, r)
+        log.Printf("[API_SERVER] Respondi a /api/find-opponent: não tenho jogadores na fila")
+    }
 }
 
-// handleRequestMatch processa o pedido final para criar uma partida
+// Substitua a função vazia handleRequestMatch em server/main.go por esta
+
+// handleRequestMatch processa o pedido final para criar uma partida distribuída.
+// O servidor que recebe este chamado se torna o "escravo" (proxy).
 func (gs *GameServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
-	// Lógica para verificar se o jogador ainda está disponível,
-	// remover o jogador da fila local e confirmar a criação da partida.
-	// Se tudo estiver OK, responde com http.StatusOK.
-	// Se o jogador não estiver mais disponível, responde com um erro (ex: http.StatusConflict).
+    var payload RequestMatchPayload
+    if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+        http.Error(w, "Corpo da requisição inválido", http.StatusBadRequest)
+        return
+    }
+
+    gs.mu.Lock()
+    defer gs.mu.Unlock()
+
+    // Verifica se ainda temos um jogador na fila
+    if len(gs.matchmakingQueue) == 0 {
+        http.Error(w, "Jogador não está mais disponível", http.StatusConflict)
+        log.Printf("[API_SERVER] Tentativa de match falhou: jogador local não está mais na fila.")
+        return
+    }
+
+    // Pega o jogador local, que será o P2
+    p2 := gs.matchmakingQueue[0]
+    gs.matchmakingQueue = gs.matchmakingQueue[1:] // Remove da fila
+
+    log.Printf("[API_SERVER] Match distribuído aceito! Jogador local %s pareado com %s do servidor %s.",
+        p2.ID, payload.RequestingPlayerID, payload.RequestingServer)
+
+    // A partir daqui, a partida será gerenciada pelo servidor solicitante (host).
+    // Este servidor precisa agora saber que seu jogador (p2) está em uma partida remota.
+    // Uma implementação completa criaria um "proxy" para encaminhar mensagens de p2
+    // para o servidor host (payload.RequestingServer).
+
+	gs.remoteMatches[p2.ID] = payload.RequestingServer
+
+    // Por simplicidade neste exemplo, apenas confirmamos a criação.
+    p2.SendMsg(protocol.ServerMsg{
+        T:          protocol.MATCH_FOUND,
+        OpponentID: payload.RequestingPlayerID,
+        Msg:        "Partida distribuída encontrada! O oponente está em outro servidor.",
+    })
+
+    w.WriteHeader(http.StatusOK)
+}
+
+func (gs *GameServer) handleMatchAction(w http.ResponseWriter, r *http.Request) {
+    var payload struct {
+        PlayerID string `json:"playerId"`
+        Message  string `json:"message"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+        http.Error(w, "Corpo inválido", http.StatusBadRequest)
+        return
+    }
+
+    var clientMsg protocol.ClientMsg
+    if err := json.Unmarshal([]byte(payload.Message), &clientMsg); err != nil {
+        http.Error(w, "Mensagem inválida", http.StatusBadRequest)
+        return
+    }
+    
+    // Encontra a partida do jogador
+    match := gs.findPlayerMatch(payload.PlayerID)
+    if match == nil {
+        http.NotFound(w, r)
+        return
+    }
+
+    // Processa a mensagem como se viesse de uma conexão TCP
+    // Precisamos de um PlayerConn para o contexto, podemos recuperá-lo da partida
+    var player *protocol.PlayerConn
+    if match.P1.ID == payload.PlayerID {
+        player = match.P1
+    } else if match.P2.ID == payload.PlayerID {
+        player = match.P2
+    }
+    
+    if player != nil {
+         // Simula a chamada original do handleConn
+        gs.handleMessage(player, &clientMsg)
+        w.WriteHeader(http.StatusOK)
+    } else {
+        http.NotFound(w, r)
+    }
+}
+
+func (gs *GameServer) handleForwardMessage(w http.ResponseWriter, r *http.Request) {
+    var payload struct {
+        TargetPlayerID string `json:"targetPlayerId"`
+        Message        string `json:"message"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+        http.Error(w, "Corpo inválido", http.StatusBadRequest)
+        return
+    }
+
+    var serverMsg protocol.ServerMsg
+    if err := json.Unmarshal([]byte(payload.Message), &serverMsg); err != nil {
+        http.Error(w, "Mensagem inválida", http.StatusBadRequest)
+        return
+    }
+
+    // Encontra o jogador local na lista de jogadores online
+    gs.mu.RLock()
+    player, ok := gs.playersOnline[payload.TargetPlayerID]
+    gs.mu.RUnlock()
+
+    if ok && player != nil && !player.IsRemote {
+        player.SendMsg(serverMsg)
+        w.WriteHeader(http.StatusOK)
+    } else {
+        log.Printf("[API_SERVER] Não foi possível encaminhar mensagem: jogador %s não encontrado ou é remoto", payload.TargetPlayerID)
+        http.NotFound(w, r)
+    }
 }
