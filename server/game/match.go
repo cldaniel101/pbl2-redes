@@ -1,14 +1,14 @@
 package game
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"pingpong/server/protocol"
+	"strings"
 	"sync"
 	"time"
-	"encoding/json"
-	"strings"
 )
 
 // Match representa uma partida 1v1
@@ -245,7 +245,6 @@ func (m *Match) broadcastRoundResult(p1Card, p2Card Card, p1Bonus, p2Bonus, p1Dm
 	// Para P2 (perspectiva invertida)
 	p2Logs := []string{}
 	for _, log := range logs {
-		// Inverte "Você" e "Oponente" nos logs para P2
 		if log == logs[0] { // primeiro log
 			p2Logs = append(p2Logs, fmt.Sprintf("Você jogou %s (ATK %d%s). Oponente jogou %s (DEF %d).",
 				p2Card.Name, p2Card.ATK,
@@ -257,7 +256,6 @@ func (m *Match) broadcastRoundResult(p1Card, p2Card Card, p1Bonus, p2Bonus, p1Dm
 				}(),
 				p1Card.Name, p1Card.DEF))
 		} else {
-			// Inverte dano causado/recebido
 			if p1Dmg > 0 && log == fmt.Sprintf("Você causou %d de dano!", p1Dmg) {
 				p2Logs = append(p2Logs, fmt.Sprintf("Você recebeu %d de dano!", p1Dmg))
 			} else if p2Dmg > 0 && log == fmt.Sprintf("Você recebeu %d de dano!", p2Dmg) {
@@ -283,13 +281,13 @@ func (m *Match) broadcastRoundResult(p1Card, p2Card Card, p1Bonus, p2Bonus, p1Dm
 		Logs: p2Logs,
 	}
 
-	m.P1.SendMsg(p1Msg)
-	m.P2.SendMsg(p2Msg)
+	// === CORREÇÃO APLICADA AQUI ===
+	sendMsgToPlayer(m.P1, p1Msg)
+	sendMsgToPlayer(m.P2, p2Msg)
 }
 
 // BroadcastState envia o estado atual para ambos jogadores
 func (m *Match) BroadcastState() {
-	// Calcula deadline apenas se pelo menos um jogador tiver autoplay ativo
 	var deadlineMs int64 = 0
 	if m.P1.AutoPlay || m.P2.AutoPlay {
 		deadlineMs = time.Until(m.Deadline).Milliseconds()
@@ -340,27 +338,23 @@ func (m *Match) EndIfGameOver() bool {
 		var p1Result, p2Result string
 
 		if m.HP[0] <= 0 && m.HP[1] <= 0 {
-			// Empate
 			p1Result = protocol.DRAW
 			p2Result = protocol.DRAW
 		} else if m.HP[0] <= 0 {
-			// P1 perdeu
 			p1Result = protocol.LOSE
 			p2Result = protocol.WIN
 		} else {
-			// P2 perdeu
 			p1Result = protocol.WIN
 			p2Result = protocol.LOSE
 		}
 
-		// Envia resultado final
-		m.P1.SendMsg(protocol.ServerMsg{T: protocol.MATCH_END, Result: p1Result})
-		m.P2.SendMsg(protocol.ServerMsg{T: protocol.MATCH_END, Result: p2Result})
+		// === CORREÇÃO APLICADA AQUI ===
+		sendMsgToPlayer(m.P1, protocol.ServerMsg{T: protocol.MATCH_END, Result: p1Result})
+		sendMsgToPlayer(m.P2, protocol.ServerMsg{T: protocol.MATCH_END, Result: p2Result})
 
 		log.Printf("[MATCH %s] Partida finalizada. P1(%s): %s, P2(%s): %s",
 			m.ID, m.P1.ID, p1Result, m.P2.ID, p2Result)
 
-		// Sinaliza que a partida terminou
 		select {
 		case m.done <- true:
 		default:
@@ -386,31 +380,24 @@ func (m *Match) AutoplayIfNeeded() {
 		return
 	}
 
-	// Verifica quais jogadores não jogaram e têm autoplay ativo
 	playersToAutoplay := []string{}
-
 	if _, played := m.Waiting[m.P1.ID]; !played && m.P1.AutoPlay {
 		playersToAutoplay = append(playersToAutoplay, m.P1.ID)
 	}
-
 	if _, played := m.Waiting[m.P2.ID]; !played && m.P2.AutoPlay {
 		playersToAutoplay = append(playersToAutoplay, m.P2.ID)
 	}
 
-	// Executa auto-play
 	for _, playerID := range playersToAutoplay {
 		playerIndex := m.GetPlayerIndex(playerID)
 		if len(m.Hands[playerIndex]) > 0 {
-			// Escolhe carta aleatória
 			randomIndex := rand.Intn(len(m.Hands[playerIndex]))
 			randomCard := m.Hands[playerIndex][randomIndex]
 			m.Waiting[playerID] = randomCard
-
 			log.Printf("[MATCH %s] Auto-play para %s: %s", m.ID, playerID, randomCard)
 		}
 	}
 
-	// Se ambos jogaram (incluindo auto-play), resolve a rodada
 	if len(m.Waiting) == 2 {
 		go m.resolveRound()
 	}
@@ -439,7 +426,6 @@ func max(a, b int) int {
 	return b
 }
 
-
 func sendMsgToPlayer(player *protocol.PlayerConn, msg protocol.ServerMsg) {
 	if player.IsRemote {
 		// --- LÓGICA PARA JOGADOR REMOTO ---
@@ -451,14 +437,12 @@ func sendMsgToPlayer(player *protocol.PlayerConn, msg protocol.ServerMsg) {
 
 		forwardURL := player.RemoteServerURL + "/api/forward"
 
-		// O corpo da requisição precisa dizer ao servidor proxy para qual jogador a mensagem se destina
 		payload := map[string]string{
 			"targetPlayerId": player.ID,
 			"message":        string(msgBytes),
 		}
 		payloadBytes, _ := json.Marshal(payload)
 
-		// Envia a mensagem para o servidor proxy
 		resp, err := player.HttpClient.Post(forwardURL, "application/json", strings.NewReader(string(payloadBytes)))
 		if err != nil {
 			log.Printf("[MATCH] Erro ao encaminhar msg para jogador remoto %s: %v", player.ID, err)
@@ -469,6 +453,6 @@ func sendMsgToPlayer(player *protocol.PlayerConn, msg protocol.ServerMsg) {
 		// --- LÓGICA PARA JOGADOR LOCAL ---
 		player.SendMsg(msg)
 	} else {
-        log.Printf("[MATCH] Aviso: Tentou enviar mensagem para jogador local sem encoder: %s", player.ID)
-    }
+		log.Printf("[MATCH] Aviso: Tentou enviar mensagem para jogador local sem encoder: %s", player.ID)
+	}
 }
