@@ -8,6 +8,7 @@ services:
       dockerfile: server/Dockerfile
     image: pingpong-server:latest
     container_name: pbl_server_1
+    hostname: server-1
     networks:
       - game-net
     ports:
@@ -16,7 +17,7 @@ services:
     environment:
       - LISTEN_ADDR=:9000
       - API_ADDR=:8000
-      - OTHER_SERVERS=http://server-2:8001,http://server-3:8002
+      - ALL_SERVERS=http://server-1:8000,http://server-2:8001,http://server-3:8002
 
   server-2:
     build:
@@ -24,6 +25,7 @@ services:
       dockerfile: server/Dockerfile
     image: pingpong-server:latest
     container_name: pbl_server_2
+    hostname: server-2
     networks:
       - game-net
     ports:
@@ -32,7 +34,7 @@ services:
     environment:
       - LISTEN_ADDR=:9000
       - API_ADDR=:8001
-      - OTHER_SERVERS=http://server-1:8000,http://server-3:8002
+      - ALL_SERVERS=http://server-1:8000,http://server-2:8001,http://server-3:8002
 
   server-3:
     build:
@@ -40,6 +42,7 @@ services:
       dockerfile: server/Dockerfile
     image: pingpong-server:latest
     container_name: pbl_server_3
+    hostname: server-3
     networks:
       - game-net
     ports:
@@ -48,7 +51,7 @@ services:
     environment:
       - LISTEN_ADDR=:9000
       - API_ADDR=:8002
-      - OTHER_SERVERS=http://server-1:8000,http://server-2:8001
+      - ALL_SERVERS=http://server-1:8000,http://server-2:8001,http://server-3:8002
 
   # --- Serviço de Cliente para Testes ---
   # Pode escalar este serviço para ter múltiplos clientes
