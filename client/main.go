@@ -93,7 +93,7 @@ var (
 	pingMutex   sync.RWMutex
 	inMatch     bool
 	currentHand []string
-	gameState   *ServerMsg
+	// CORREÇÃO: A variável 'gameState' foi removida porque não era utilizada.
 )
 
 func handleConn(conn net.Conn) {
@@ -163,17 +163,14 @@ func handleConn(conn net.Conn) {
 			if strings.HasPrefix(text, "/") {
 				handleCommand(text, encoder)
 			} else if inMatch && len(text) == 1 && text >= "1" && text <= "5" {
-				// Atalho para jogar carta por índice
 				cardIndex, _ := strconv.Atoi(text)
 				playCardByIndex(cardIndex, encoder)
 			} else {
-				// Enviar chat
 				sendMessage(encoder, ClientMsg{T: "CHAT", Text: text})
 			}
 		}
 	}()
 
-	// Aguarda indefinidamente
 	select {}
 }
 
@@ -183,7 +180,6 @@ func sendMessage(encoder *json.Encoder, msg ClientMsg) {
 	}
 }
 
-// playCardByIndex joga uma carta pelo índice (1-5)
 func playCardByIndex(cardIndex int, encoder *json.Encoder) {
 	if !inMatch {
 		fmt.Println("❌ Você não está em uma partida!")
@@ -207,7 +203,6 @@ func playCardByIndex(cardIndex int, encoder *json.Encoder) {
 	sendMessage(encoder, ClientMsg{T: "PLAY", CardID: cardID})
 }
 
-// showHand exibe a mão atual com detalhes das cartas
 func showHand() {
 	if !inMatch || len(currentHand) == 0 {
 		fmt.Println("❌ Você não está em uma partida ou não tem cartas na mão!")
@@ -234,7 +229,7 @@ func handleServerMessage(msg *ServerMsg) {
 		inMatch = true
 
 	case "STATE":
-		gameState = msg
+		// CORREÇÃO: A atribuição a 'gameState' foi removida.
 		currentHand = msg.You.Hand
 		fmt.Printf("\n=== RODADA %d ===\n", msg.Round)
 		fmt.Printf("💚 Seu HP: %d | ❤️ HP do Oponente: %d\n", msg.You.HP, msg.Opponent.HP)
@@ -257,8 +252,6 @@ func handleServerMessage(msg *ServerMsg) {
 
 	case "ROUND_RESULT":
 		fmt.Println("\n=== RESULTADO DA RODADA ===")
-
-		// Informações da sua carta
 		yourCard, yourExists := cardDB[msg.You.CardID]
 		if yourExists {
 			fmt.Printf("🎴 Você jogou: %s (ATK %d", yourCard.Name, yourCard.ATK)
@@ -269,18 +262,14 @@ func handleServerMessage(msg *ServerMsg) {
 		} else {
 			fmt.Printf("🎴 Você jogou: %s", msg.You.CardID)
 		}
-
-		// Informações da carta do oponente
 		oppCard, oppExists := cardDB[msg.Opponent.CardID]
 		if oppExists {
 			fmt.Printf("\n🎴 Oponente jogou: %s (DEF %d)", oppCard.Name, oppCard.DEF)
 		} else {
 			fmt.Printf("\n🎴 Oponente jogou: %s", msg.Opponent.CardID)
 		}
-
 		fmt.Printf("\n⚔️ Dano causado: %d | 🛡️ Dano recebido: %d\n", msg.You.DmgDealt, msg.You.DmgTaken)
 		fmt.Printf("💚 Seu HP: %d | ❤️ HP do Oponente: %d\n", msg.You.HP, msg.Opponent.HP)
-
 		if len(msg.Logs) > 0 {
 			fmt.Println("📜 Logs:")
 			for _, log := range msg.Logs {
@@ -306,7 +295,10 @@ func handleServerMessage(msg *ServerMsg) {
 		fmt.Printf("📊 Estoque restante: %d pacotes\n", msg.Stock)
 
 	case "ERROR":
+		// CORREÇÃO: Adicionado um caso específico para "QUEUED" para formatar a mensagem corretamente.
 		switch msg.Code {
+		case "QUEUED":
+			fmt.Printf("✅ %s\n", msg.Msg)
 		case "AUTOPLAY_ENABLED":
 			fmt.Printf("✅ %s\n", msg.Msg)
 		case "AUTOPLAY_DISABLED":
@@ -370,7 +362,6 @@ func handleCommand(command string, encoder *json.Encoder) {
 		pingMutex.Lock()
 		showPing = !showPing
 		pingMutex.Unlock()
-
 		if showPing {
 			fmt.Println("🏓 Exibição de RTT ativada")
 		} else {
