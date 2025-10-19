@@ -83,6 +83,18 @@ func (sm *StateManager) FindPlayerMatch(playerID string) *game.Match {
 	return nil
 }
 
+// FindMatchByID encontra uma partida ativa pelo seu ID.
+func (sm *StateManager) FindMatchByID(matchID string) *game.Match {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	match, ok := sm.ActiveMatches[matchID]
+	if ok {
+		return match
+	}
+	return nil
+}
+
 // CleanupPlayer remove um jogador de todas as estruturas de estado (online, fila, partida)
 // e retorna o oponente caso o jogador estivesse em uma partida, para notificação.
 func (sm *StateManager) CleanupPlayer(player *protocol.PlayerConn) *protocol.PlayerConn {
