@@ -46,6 +46,12 @@ func (s *TCPServer) handleConn(conn net.Conn) {
 
 // readLoop lê continuamente mensagens do socket do cliente e publica-as no broker.
 func (s *TCPServer) readLoop(player *protocol.PlayerConn) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[CLIENT_MGR] Panic recuperado em readLoop para o cliente %s: %v", player.ID, r)
+		}
+	}()
+
 	for {
 		msg, err := player.ReadMsg()
 		if err != nil {
@@ -58,6 +64,12 @@ func (s *TCPServer) readLoop(player *protocol.PlayerConn) {
 
 // writeLoop escuta um canal de subscrição e escreve as mensagens recebidas para o socket do cliente.
 func (s *TCPServer) writeLoop(player *protocol.PlayerConn, sub pubsub.Subscriber) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[CLIENT_MGR] Panic recuperado em writeLoop para o cliente %s: %v", player.ID, r)
+		}
+	}()
+
 	for msg := range sub {
 		if serverMsg, ok := msg.Payload.(protocol.ServerMsg); ok {
 			if err := player.SendMsg(serverMsg); err != nil {
