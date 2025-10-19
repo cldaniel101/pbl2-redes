@@ -6,9 +6,27 @@ import (
 	"math/rand"
 	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
+	"pingpong/server/s2s"
 	"sync"
 	"time"
 )
+
+// DistributedMatchInfo contém os detalhes necessários sobre uma partida distribuída
+// para que a lógica do jogo encaminhe as mensagens, sem depender do pacote de estado.
+type DistributedMatchInfo struct {
+	MatchID     string
+	HostServer  string
+	GuestServer string
+	HostPlayer  string
+	GuestPlayer string
+}
+
+// StateInformer define o contrato do que o Match precisa saber
+// sobre o estado mais amplo do servidor, para quebrar o ciclo de importação com o pacote de estado.
+type StateInformer interface {
+	GetDistributedMatchInfo(matchID string) (DistributedMatchInfo, bool)
+	IsPlayerOnline(playerID string) bool
+}
 
 // Match representa uma partida 1v1
 type Match struct {
@@ -26,23 +44,25 @@ type Match struct {
 	mu       sync.Mutex
 	done     chan bool
 	broker   *pubsub.Broker
+	informer StateInformer
 }
 
 // NewMatch cria uma nova partida
-func NewMatch(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pubsub.Broker) *Match {
+func NewMatch(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pubsub.Broker, informer StateInformer) *Match {
 	match := &Match{
-		ID:      id,
-		P1:      p1,
-		P2:      p2,
-		HP:      [2]int{HPStart, HPStart},
-		Hands:   [2]Hand{},
-		Discard: [2][]string{{}, {}},
-		Round:   1,
-		State:   StateAwaitingPlays,
-		Waiting: make(map[string]string),
-		CardDB:  cardDB,
-		done:    make(chan bool, 1),
-		broker:  broker,
+		ID:       id,
+		P1:       p1,
+		P2:       p2,
+		HP:       [2]int{HPStart, HPStart},
+		Hands:    [2]Hand{},
+		Discard:  [2][]string{{}, {}},
+		Round:    1,
+		State:    StateAwaitingPlays,
+		Waiting:  make(map[string]string),
+		CardDB:   cardDB,
+		done:     make(chan bool, 1),
+		broker:   broker,
+		informer: informer,
 	}
 
 	// Gera mãos iniciais
@@ -104,6 +124,10 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 		return fmt.Errorf("carta inválida")
 	}
 
+	// Se a partida for distribuída, retransmite a jogada para o outro servidor
+	// ANTES de registrar a jogada localmente.
+	m.forwardPlayIfNeeded(playerID, cardID)
+
 	// Registra a jogada
 	m.Waiting[playerID] = cardID
 
@@ -152,7 +176,7 @@ func (m *Match) resolveRound() {
 	m.refillHands()
 
 	// Cria logs da rodada
-	logs := m.createRoundLogs(p1Card, p2Card, p1Bonus, p2Bonus, p1DamageDealt, p2DamageDealt)
+	logs := m.createRoundLogs(p1Card, p2Card, p1Bonus, p1DamageDealt, p2DamageDealt)
 
 	// Envia resultado da rodada
 	m.broadcastRoundResult(p1Card, p2Card, p1Bonus, p2Bonus, p1DamageDealt, p2DamageDealt, logs)
@@ -202,7 +226,7 @@ func (m *Match) refillHands() {
 }
 
 // createRoundLogs cria os logs da rodada
-func (m *Match) createRoundLogs(p1Card, p2Card Card, p1Bonus, p2Bonus, p1Dmg, p2Dmg int) []string {
+func (m *Match) createRoundLogs(p1Card, p2Card Card, p1Bonus, p1Dmg, p2Dmg int) []string {
 	logs := []string{}
 
 	p1BonusText := ""
@@ -284,8 +308,8 @@ func (m *Match) broadcastRoundResult(p1Card, p2Card Card, p1Bonus, p2Bonus, p1Dm
 		Logs: p2Logs,
 	}
 
-	m.sendToPlayer(m.P1.ID, p1Msg)
-	m.sendToPlayer(m.P2.ID, p2Msg)
+	m.sendToPlayerSmart(m.P1.ID, p1Msg)
+	m.sendToPlayerSmart(m.P2.ID, p2Msg)
 }
 
 // BroadcastState envia o estado atual para ambos jogadores
@@ -329,8 +353,8 @@ func (m *Match) BroadcastState() {
 		DeadlineMs: deadlineMs,
 	}
 
-	m.sendToPlayer(m.P1.ID, p1Msg)
-	m.sendToPlayer(m.P2.ID, p2Msg)
+	m.sendToPlayerSmart(m.P1.ID, p1Msg)
+	m.sendToPlayerSmart(m.P2.ID, p2Msg)
 }
 
 // EndIfGameOver verifica se o jogo terminou e envia MATCH_END
@@ -355,8 +379,8 @@ func (m *Match) EndIfGameOver() bool {
 		}
 
 		// Envia resultado final
-		m.sendToPlayer(m.P1.ID, protocol.ServerMsg{T: protocol.MATCH_END, Result: p1Result})
-		m.sendToPlayer(m.P2.ID, protocol.ServerMsg{T: protocol.MATCH_END, Result: p2Result})
+		m.sendToPlayerSmart(m.P1.ID, protocol.ServerMsg{T: protocol.MATCH_END, Result: p1Result})
+		m.sendToPlayerSmart(m.P2.ID, protocol.ServerMsg{T: protocol.MATCH_END, Result: p2Result})
 
 		log.Printf("[MATCH %s] Partida finalizada. P1(%s): %s, P2(%s): %s",
 			m.ID, m.P1.ID, p1Result, m.P2.ID, p2Result)
@@ -374,7 +398,74 @@ func (m *Match) EndIfGameOver() bool {
 
 // sendToPlayer envia uma mensagem para um jogador específico via pub/sub
 func (m *Match) sendToPlayer(playerID string, msg protocol.ServerMsg) {
-	m.broker.Publish(fmt.Sprintf("player.%s", playerID), msg)
+	if m.broker != nil {
+		m.broker.Publish(fmt.Sprintf("player.%s", playerID), msg)
+	}
+}
+
+// sendToPlayerSmart decide se envia uma mensagem localmente via broker ou
+// retransmite para outro servidor.
+func (m *Match) sendToPlayerSmart(playerID string, msg protocol.ServerMsg) {
+	distMatch, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
+
+	// Se não for uma partida distribuída, envia sempre localmente.
+	if !isDistributed {
+		m.sendToPlayer(playerID, msg)
+		return
+	}
+
+	// Verifica se o jogador alvo é o anfitrião ou o convidado.
+	isTargetHost := distMatch.HostPlayer == playerID
+	isTargetGuest := distMatch.GuestPlayer == playerID
+
+	// Se o jogador não pertence a esta partida distribuída, não faz nada.
+	if !isTargetHost && !isTargetGuest {
+		return
+	}
+
+	// Verifica se o jogador está neste servidor.
+	isPlayerLocal := m.informer.IsPlayerOnline(playerID)
+
+	if isPlayerLocal {
+		m.sendToPlayer(playerID, msg)
+	} else {
+		// O jogador é remoto, determina para qual servidor retransmitir.
+		var remoteServer string
+		if isTargetHost {
+			remoteServer = distMatch.HostServer
+		} else {
+			remoteServer = distMatch.GuestServer
+		}
+		log.Printf("[MATCH %s] A retransmitir mensagem do tipo %s para o jogador remoto %s no servidor %s", m.ID, msg.T, playerID, remoteServer)
+		s2s.ForwardMessage(remoteServer, playerID, msg)
+	}
+}
+
+// forwardPlayIfNeeded verifica se uma jogada precisa ser retransmitida para um oponente
+// em outro servidor e, se for o caso, executa a retransmissão.
+func (m *Match) forwardPlayIfNeeded(playerID, cardID string) {
+	distMatch, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
+	if !isDistributed {
+		return // Não faz nada em partidas locais
+	}
+
+	// Verifica se o jogador que fez a jogada está neste servidor.
+	// Apenas retransmitimos jogadas de jogadores locais.
+	isPlayerLocal := m.informer.IsPlayerOnline(playerID)
+	if !isPlayerLocal {
+		return
+	}
+
+	// Determina o servidor do oponente.
+	var opponentServer string
+	if distMatch.HostPlayer == playerID {
+		opponentServer = distMatch.GuestServer
+	} else {
+		opponentServer = distMatch.HostServer
+	}
+
+	log.Printf("[MATCH %s] Retransmitindo jogada do jogador local %s para o servidor do oponente em %s", m.ID, playerID, opponentServer)
+	s2s.ForwardPlay(opponentServer, m.ID, playerID, cardID)
 }
 
 // scheduleAutoPlay agenda o auto-play se necessário

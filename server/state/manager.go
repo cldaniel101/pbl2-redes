@@ -1,15 +1,15 @@
 package state
 
 import (
+	"errors"
 	"fmt"
 	"log"
-	"sync"
-	"time"
-	"strings"
-	"errors"
 	"pingpong/server/game"
 	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
+	"strings"
+	"sync"
+	"time"
 )
 
 // DistributedMatch armazena informações sobre partidas que ocorrem entre diferentes servidores.
@@ -140,7 +140,7 @@ func (sm *StateManager) CreateLocalMatch(p1, p2 *protocol.PlayerConn, broker *pu
 	defer sm.mu.Unlock()
 
 	matchID := fmt.Sprintf("local_match_%d", time.Now().UnixNano())
-	match := game.NewMatch(matchID, p1, p2, sm.CardDB, broker)
+	match := game.NewMatch(matchID, p1, p2, sm.CardDB, broker, sm)
 	sm.ActiveMatches[matchID] = match
 
 	log.Printf("[STATE] Partida local %s criada entre %s e %s.", matchID, p1.ID, p2.ID)
@@ -209,12 +209,12 @@ func (sm *StateManager) ConfirmAndCreateDistributedMatch(matchID, guestPlayerID,
 		GuestPlayer: guestPlayerID,
 	}
 	sm.DistributedMatches[matchID] = distMatch
-    
-    // 4. Cria uma partida "proxy" localmente. (Esta parte pode ser omitida se não
-    // for necessário um objeto Match no servidor convidado, mas pode ser útil).
-    // hostPlayerConn := protocol.NewPlayerConn(hostPlayerID, nil)
-    // match := game.NewMatch(matchID, hostPlayerConn, guestPlayer, sm.CardDB, nil) // Broker é nil aqui
-    // sm.ActiveMatches[matchID] = match
+
+	// 4. Cria uma partida "proxy" localmente. (Esta parte pode ser omitida se não
+	// for necessário um objeto Match no servidor convidado, mas pode ser útil).
+	// hostPlayerConn := protocol.NewPlayerConn(hostPlayerID, nil)
+	// match := game.NewMatch(matchID, hostPlayerConn, guestPlayer, sm.CardDB, nil) // Broker é nil aqui
+	// sm.ActiveMatches[matchID] = match
 
 	log.Printf("[STATE] Partida distribuída %s confirmada para o jogador local %s.", matchID, guestPlayerID)
 
@@ -232,7 +232,7 @@ func (sm *StateManager) GetMatchmakingQueueSnapshot() []*protocol.PlayerConn {
 	snapshot := make([]*protocol.PlayerConn, len(sm.MatchmakingQueue))
 	// Copia os elementos da fila original para a nova slice.
 	copy(snapshot, sm.MatchmakingQueue)
-	
+
 	return snapshot
 }
 
@@ -288,10 +288,39 @@ func (sm *StateManager) CreateDistributedMatchAsHost(matchID string, hostPlayer 
 
 	// 4. Cria o objeto da partida localmente, com o jogador local como P1
 	// e o placeholder do jogador remoto como P2.
-	match := game.NewMatch(matchID, hostPlayer, guestPlayerPlaceholder, sm.CardDB, broker)
+	match := game.NewMatch(matchID, hostPlayer, guestPlayerPlaceholder, sm.CardDB, broker, sm)
 	sm.ActiveMatches[matchID] = match
 
 	log.Printf("[STATE] Partida distribuída %s criada pelo anfitrião %s.", matchID, hostPlayer.ID)
 
 	return match, nil
+}
+
+// GetDistributedMatchInfo implementa a interface game.StateInformer.
+func (sm *StateManager) GetDistributedMatchInfo(matchID string) (game.DistributedMatchInfo, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	distMatch, ok := sm.DistributedMatches[matchID]
+	if !ok {
+		return game.DistributedMatchInfo{}, false
+	}
+
+	// Traduz de state.DistributedMatch para game.DistributedMatchInfo
+	return game.DistributedMatchInfo{
+		MatchID:     distMatch.MatchID,
+		HostServer:  distMatch.HostServer,
+		GuestServer: distMatch.GuestServer,
+		HostPlayer:  distMatch.HostPlayer,
+		GuestPlayer: distMatch.GuestPlayer,
+	}, true
+}
+
+// IsPlayerOnline implementa a interface game.StateInformer.
+func (sm *StateManager) IsPlayerOnline(playerID string) bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	_, ok := sm.PlayersOnline[playerID]
+	return ok
 }
