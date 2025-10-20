@@ -58,6 +58,10 @@ func (s *TCPServer) readLoop(player *protocol.PlayerConn) {
 			log.Printf("[CLIENT_MGR] Erro ao ler do cliente %s: %v. A encerrar a conexão.", player.ID, err)
 			return
 		}
+		if msg == nil {
+			log.Printf("[CLIENT_MGR] Cliente %s desconectou-se (EOF). A encerrar a conexão.", player.ID)
+			return // Sai do loop, acionando a limpeza.
+		}
 		s.broker.Publish("client.messages", protocol.ClientAction{Player: player, Msg: msg})
 	}
 }
