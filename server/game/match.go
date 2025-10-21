@@ -112,16 +112,26 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 		return fmt.Errorf("jogador não está nesta partida")
 	}
 
-	// Valida se a carta está na mão do jogador
-	cardIndex := -1
-	for i, handCardID := range m.Hands[playerIndex] {
-		if handCardID == cardID {
-			cardIndex = i
-			break
+	// Se a entrada é um índice (1-5), converte para o ID da carta
+	if len(cardID) == 1 && cardID[0] >= '1' && cardID[0] <= '5' {
+		cardIndex := int(cardID[0] - '1')
+		if cardIndex >= 0 && cardIndex < len(m.Hands[playerIndex]) {
+			cardID = m.Hands[playerIndex][cardIndex]
+		} else {
+			return fmt.Errorf("índice de carta inválido")
 		}
-	}
-	if cardIndex == -1 {
-		return fmt.Errorf("carta não está na mão do jogador")
+	} else {
+		// Se não é um índice, valida se a carta está na mão do jogador
+		cardIndex := -1
+		for i, handCardID := range m.Hands[playerIndex] {
+			if handCardID == cardID {
+				cardIndex = i
+				break
+			}
+		}
+		if cardIndex == -1 {
+			return fmt.Errorf("carta não está na mão do jogador")
+		}
 	}
 
 	// Valida se a carta existe no CardDB
@@ -333,6 +343,9 @@ func (m *Match) broadcastRoundResult(p1Card, p2Card Card, p1Bonus, p2Bonus, p1Dm
 
 // BroadcastState envia o estado atual para ambos jogadores
 func (m *Match) BroadcastState() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	// Calcula deadline apenas se pelo menos um jogador tiver autoplay ativo
 	var deadlineMs int64 = 0
 	if m.P1.AutoPlay || m.P2.AutoPlay {
@@ -341,6 +354,17 @@ func (m *Match) BroadcastState() {
 			deadlineMs = 0
 		}
 	}
+
+	// Garante que as mãos estão atualizadas
+	if len(m.Hands[0]) < 5 {
+		m.refillHands()
+	}
+	if len(m.Hands[1]) < 5 {
+		m.refillHands()
+	}
+
+	log.Printf("[MATCH %s] Estado atual - P1 Hand: %v, P2 Hand: %v",
+		m.ID, m.Hands[0], m.Hands[1])
 
 	// Para P1
 	p1Msg := protocol.ServerMsg{
