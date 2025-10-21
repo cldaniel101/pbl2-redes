@@ -82,6 +82,7 @@ func (s *APIServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
 		req.HostPlayerID,
 		r.RemoteAddr, // O endereço do servidor anfitrião
 		s.serverAddr, // O endereço deste servidor (convidado)
+		s.broker,
 	)
 
 	if err != nil {

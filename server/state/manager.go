@@ -185,7 +185,7 @@ func (sm *StateManager) GetFirstPlayerInQueue() *protocol.PlayerConn {
 // ConfirmAndCreateDistributedMatch é chamada pelo servidor convidado para finalizar
 // a criação de uma partida. Ele verifica se o jogador convidado ainda está disponível,
 // remove-o da fila e cria as estruturas de estado para a partida distribuída.
-func (sm *StateManager) ConfirmAndCreateDistributedMatch(matchID, guestPlayerID, hostPlayerID, hostAddr, guestAddr string) (*protocol.PlayerConn, error) {
+func (sm *StateManager) ConfirmAndCreateDistributedMatch(matchID, guestPlayerID, hostPlayerID, hostAddr, guestAddr string, broker *pubsub.Broker) (*protocol.PlayerConn, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -212,9 +212,9 @@ func (sm *StateManager) ConfirmAndCreateDistributedMatch(matchID, guestPlayerID,
 
 	// 4. Cria uma partida "proxy" localmente. (Esta parte pode ser omitida se não
 	// for necessário um objeto Match no servidor convidado, mas pode ser útil).
-	// hostPlayerConn := protocol.NewPlayerConn(hostPlayerID, nil)
-	// match := game.NewMatch(matchID, hostPlayerConn, guestPlayer, sm.CardDB, nil) // Broker é nil aqui
-	// sm.ActiveMatches[matchID] = match
+	hostPlayerConn := protocol.NewPlayerConn(hostPlayerID, nil)
+	match := game.NewMatch(matchID, hostPlayerConn, guestPlayer, sm.CardDB, broker, sm) // Broker é nil aqui
+	sm.ActiveMatches[matchID] = match	
 
 	log.Printf("[STATE] Partida distribuída %s confirmada para o jogador local %s.", matchID, guestPlayerID)
 

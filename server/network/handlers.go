@@ -69,19 +69,19 @@ func (s *TCPServer) sendToPlayer(playerID string, msg protocol.ServerMsg) {
 func (s *TCPServer) handleMessage(player *protocol.PlayerConn, msg *protocol.ClientMsg) {
 	switch msg.T {
 	case protocol.FIND_MATCH:
-		s.handleFindMatch(player)
+		s.handleFindMatch(player) // jogador entrou na fila para encontrar uma partida 
 	case protocol.PLAY:
-		s.handlePlay(player, msg.CardID)
+		s.handlePlay(player, msg.CardID) // O jogador jogou uma carta numa partida
 	case protocol.CHAT:
-		s.handleChat(player, msg.Text)
+		s.handleChat(player, msg.Text) // O jogador enviou uma mensagem de chat.
 	case protocol.PING:
-		s.handlePing(player, msg.TS)
+		s.handlePing(player, msg.TS) // O cliente enviou uma mensagem PING para medir a latência.
 	case protocol.OPEN_PACK:
-		s.handleOpenPack(player)
+		s.handleOpenPack(player) // O jogador quer abrir um pacote de cartas.
 	case protocol.AUTOPLAY:
-		s.handleAutoPlay(player, true)
+		s.handleAutoPlay(player, true) // O jogador ativou o autoplay.
 	case protocol.NOAUTOPLAY:
-		s.handleAutoPlay(player, false)
+		s.handleAutoPlay(player, false) // O jogador desativou o autoplay.
 	default:
 		s.sendToPlayer(player.ID, protocol.ServerMsg{
 			T:    protocol.ERROR,
@@ -97,7 +97,7 @@ func (s *TCPServer) handleFindMatch(player *protocol.PlayerConn) {
 	s.stateManager.AddPlayerToQueue(player)
 	s.sendToPlayer(player.ID, protocol.ServerMsg{
 		T:    protocol.ERROR,
-		Code: "QUEUED",
+		Code: "QUEUED",	
 		Msg:  "Você entrou na fila de matchmaking.",
 	})
 }
