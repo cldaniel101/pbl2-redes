@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
-	"pingpong/server/game" 
+	"pingpong/server/game"
 	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
 	"pingpong/server/state"
@@ -20,9 +22,9 @@ type MatchmakingService struct {
 	stateManager      *state.StateManager
 	broker            *pubsub.Broker
 	httpClient        *http.Client
-	serverAddress     string   // Endereço deste servidor (ex: http://server-1:8000)
-	allServers        []string // Lista de todos os servidores no cluster
-	nextServerAddress string   // O próximo servidor no anel
+	serverAddress     string      // Endereço deste servidor (ex: http://server-1:8000)
+	allServers        []string    // Lista de todos os servidores no cluster
+	nextServerAddress string      // O próximo servidor no anel
 	tokenAcquiredChan <-chan bool // Canal para receber a notificação do token
 }
 
@@ -99,21 +101,29 @@ func (s *MatchmakingService) findAndCreateDistributedMatch(localPlayer *protocol
 
 		log.Printf("[MATCHMAKING] Oponente %s encontrado em %s. A solicitar partida...", opponentInfo.PlayerID, serverAddr)
 		matchID := fmt.Sprintf("dist_match_%d", time.Now().UnixNano())
+
+		// Usa o formato correto de URL do servidor remoto
+		remoteURL := fmt.Sprintf("http://server-%s:8000", strings.TrimPrefix(serverAddr, "http://server-"))
+
 		requestBody, _ := json.Marshal(map[string]string{
 			"matchId":       matchID,
 			"hostPlayerId":  localPlayer.ID,
 			"guestPlayerId": opponentInfo.PlayerID,
 		})
 
-		resp, err = s.httpClient.Post(serverAddr+"/api/request-match", "application/json", bytes.NewBuffer(requestBody))
-		if err != nil || resp.StatusCode != http.StatusOK {
-			if resp != nil {
-				_ = resp.Body.Close()
-			}
-			log.Printf("[MATCHMAKING] Falha ao solicitar partida com %s.", serverAddr)
+		log.Printf("[MATCHMAKING] Enviando requisição de partida para %s", remoteURL+"/api/request-match")
+		resp, err = s.httpClient.Post(remoteURL+"/api/request-match", "application/json", bytes.NewBuffer(requestBody))
+		if err != nil {
+			log.Printf("[MATCHMAKING] Erro ao conectar com %s: %v", remoteURL, err)
 			return false
 		}
-		_ = resp.Body.Close()
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			log.Printf("[MATCHMAKING] Falha ao solicitar partida com %s. Status: %d, Body: %s", remoteURL, resp.StatusCode, string(bodyBytes))
+			return false
+		}
 
 		s.stateManager.RemovePlayersFromQueue(localPlayer)
 		match, err := s.stateManager.CreateDistributedMatchAsHost(matchID, localPlayer, opponentInfo.PlayerID, s.serverAddress, serverAddr, s.broker)
@@ -121,7 +131,7 @@ func (s *MatchmakingService) findAndCreateDistributedMatch(localPlayer *protocol
 			log.Printf("[MATCHMAKING] Erro ao criar partida distribuída localmente: %v", err)
 			return false
 		}
-		
+
 		log.Printf("[MATCHMAKING] Partida distribuída %s criada com sucesso!", matchID)
 		s.notifyPlayersOfMatch(match, localPlayer, match.P2)
 		go s.monitorMatch(match)
