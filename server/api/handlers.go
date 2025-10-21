@@ -7,6 +7,7 @@ import (
 	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
 	"pingpong/server/state"
+	"strings"
 )
 
 // APIServer lida com as requisições HTTP da API inter-servidores.
@@ -35,7 +36,7 @@ func (s *APIServer) Router() http.Handler {
 	mux.HandleFunc("/api/find-opponent", s.handleFindOpponent)
 	mux.HandleFunc("/api/request-match", s.handleRequestMatch)
 	mux.HandleFunc("/api/receive-token", s.handleReceiveToken)
-	mux.HandleFunc("/api/forward/play", s.handleForwardPlay)
+	mux.HandleFunc("/matches/", s.handleMatchAction) // Novo endpoint para ações da partida
 	mux.HandleFunc("/api/forward/message", s.handleForwardMessage)
 	return mux
 }
@@ -115,31 +116,47 @@ func (s *APIServer) handleReceiveToken(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleForwardPlay recebe uma jogada de um jogador remoto e aplica-a à partida local.
-func (s *APIServer) handleForwardPlay(w http.ResponseWriter, r *http.Request) {
+// handleMatchAction recebe uma ação de um jogador remoto (ex: jogar uma carta)
+// e aplica-a à partida local. A URL deve ser no formato /matches/{matchID}/action.
+func (s *APIServer) handleMatchAction(w http.ResponseWriter, r *http.Request) {
+	// Extrai o ID da partida da URL.
+	pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/matches/"), "/")
+	if len(pathParts) < 2 || pathParts[1] != "action" {
+		log.Printf("[API] URL de ação inválida: %s", r.URL.Path)
+		http.NotFound(w, r)
+		return
+	}
+	matchID := pathParts[0]
+
+	// Decodifica o corpo da requisição para obter os detalhes da ação.
 	var req struct {
 		PlayerID string `json:"playerId"`
 		CardID   string `json:"cardId"`
-		MatchID  string `json:"matchId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Pedido inválido", http.StatusBadRequest)
 		return
 	}
 
-	match := s.stateManager.FindPlayerMatch(req.PlayerID)
-	if match == nil || match.ID != req.MatchID {
-		log.Printf("[API] Jogada recebida para partida %s não encontrada para o jogador %s", req.MatchID, req.PlayerID)
+	// Encontra a partida através do gestor de estado.
+	// Nota: podemos precisar de um método mais direto para encontrar por ID de partida.
+	match := s.stateManager.FindMatchByID(matchID)
+	if match == nil {
+		log.Printf("[API] Ação recebida para partida %s não encontrada", matchID)
 		http.NotFound(w, r)
 		return
 	}
 
+	// Aplica a ação (jogar a carta) na partida.
+	// A lógica dentro de PlayCard já impede o re-encaminhamento (efeito eco).
 	if err := match.PlayCard(req.PlayerID, req.CardID); err != nil {
-		log.Printf("[API] Erro ao processar jogada retransmitida de %s: %v", req.PlayerID, err)
+		log.Printf("[API] Erro ao processar ação retransmitida de %s para a partida %s: %v", req.PlayerID, matchID, err)
 		// Opcional: poderia retornar um erro para o servidor anfitrião.
+		http.Error(w, "Erro ao processar a ação", http.StatusInternalServerError)
+		return
 	}
 
-	log.Printf("[API] Jogada retransmitida de %s processada com sucesso.", req.PlayerID)
+	log.Printf("[API] Ação do jogador %s para a partida %s processada com sucesso.", req.PlayerID, matchID)
 	w.WriteHeader(http.StatusOK)
 }
 

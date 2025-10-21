@@ -9,19 +9,24 @@ import (
 	"pingpong/server/protocol"
 )
 
-// ForwardPlay forwards a player's card play to the opponent's server.
-func ForwardPlay(opponentServer, matchID, playerID, cardID string) {
+// ForwardAction retransmite a ação de um jogador (ex: jogar uma carta) para o servidor do oponente.
+func ForwardAction(opponentServer, matchID, playerID, cardID string) {
 	payload := map[string]string{
-		"matchId":  matchID,
 		"playerId": playerID,
 		"cardId":   cardID,
 	}
 	jsonPayload, _ := json.Marshal(payload)
 
-	url := fmt.Sprintf("%s/api/forward/play", opponentServer)
-	_, err := http.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+	url := fmt.Sprintf("%s/matches/%s/action", opponentServer, matchID)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
 	if err != nil {
-		log.Printf("[S2S] Failed to forward play to %s: %v", url, err)
+		log.Printf("[S2S] Falha ao retransmitir a ação para %s: %v", url, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[S2S] Erro ao retransmitir ação: status code %d", resp.StatusCode)
 	}
 }
 

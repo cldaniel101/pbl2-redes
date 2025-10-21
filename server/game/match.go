@@ -465,7 +465,7 @@ func (m *Match) forwardPlayIfNeeded(playerID, cardID string) {
 	}
 
 	log.Printf("[MATCH %s] Retransmitindo jogada do jogador local %s para o servidor do oponente em %s", m.ID, playerID, opponentServer)
-	s2s.ForwardPlay(opponentServer, m.ID, playerID, cardID)
+	s2s.ForwardAction(opponentServer, m.ID, playerID, cardID)
 }
 
 // scheduleAutoPlay agenda o auto-play se necessário
