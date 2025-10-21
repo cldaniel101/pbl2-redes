@@ -102,20 +102,24 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 	defer m.mu.Unlock()
 
 	// Valida se o jogador está na partida
-	playerIndex := m.GetPlayerIndex(playerID)
-	if (playerIndex == 0 && m.P1.ID != playerID) || (playerIndex == 1 && m.P2.ID != playerID) {
+	playerIndex := -1
+	if m.P1.ID == playerID {
+		playerIndex = 0
+	} else if m.P2.ID == playerID {
+		playerIndex = 1
+	} else {
 		return fmt.Errorf("jogador não está nesta partida")
 	}
 
 	// Valida se a carta está na mão do jogador
-	found := false
-	for _, handCardID := range m.Hands[playerIndex] {
+	cardIndex := -1
+	for i, handCardID := range m.Hands[playerIndex] {
 		if handCardID == cardID {
-			found = true
+			cardIndex = i
 			break
 		}
 	}
-	if !found {
+	if cardIndex == -1 {
 		return fmt.Errorf("carta não está na mão do jogador")
 	}
 
@@ -128,7 +132,7 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 	// ANTES de registrar a jogada localmente.
 	m.forwardPlayIfNeeded(playerID, cardID)
 
-	// Registra a jogada
+	// Registra a jogada e remove a carta da mão
 	m.Waiting[playerID] = cardID
 
 	// Verifica se ambos jogaram
@@ -167,10 +171,13 @@ func (m *Match) resolveRound() {
 	m.HP[0] -= p2DamageDealt // P2 causa dano em P1
 
 	// Remove cartas das mãos e adiciona ao descarte
-	m.removeCardFromHand(0, p1CardID)
-	m.removeCardFromHand(1, p2CardID)
-	m.Discard[0] = append(m.Discard[0], p1CardID)
-	m.Discard[1] = append(m.Discard[1], p2CardID)
+	playerIndex1 := m.GetPlayerIndex(m.P1.ID)
+	playerIndex2 := m.GetPlayerIndex(m.P2.ID)
+
+	m.removeCardFromHand(playerIndex1, p1CardID)
+	m.removeCardFromHand(playerIndex2, p2CardID)
+	m.Discard[playerIndex1] = append(m.Discard[playerIndex1], p1CardID)
+	m.Discard[playerIndex2] = append(m.Discard[playerIndex2], p2CardID)
 
 	// Repõe as mãos
 	m.refillHands()
@@ -205,12 +212,23 @@ func (m *Match) resolveRound() {
 
 // removeCardFromHand remove uma carta da mão do jogador
 func (m *Match) removeCardFromHand(playerIndex int, cardID string) {
+	// Proteção contra índice inválido
+	if playerIndex < 0 || playerIndex >= len(m.Hands) {
+		log.Printf("[MATCH %s] Erro ao remover carta: índice de jogador inválido %d", m.ID, playerIndex)
+		return
+	}
+
+	// Procura a carta na mão e a remove
 	for i, handCardID := range m.Hands[playerIndex] {
 		if handCardID == cardID {
+			// Remove a carta mantendo a ordem das demais
 			m.Hands[playerIndex] = append(m.Hands[playerIndex][:i], m.Hands[playerIndex][i+1:]...)
-			break
+			log.Printf("[MATCH %s] Carta %s removida da mão do jogador %d", m.ID, cardID, playerIndex)
+			return
 		}
 	}
+	
+	log.Printf("[MATCH %s] Aviso: tentativa de remover carta %s que não está na mão do jogador %d", m.ID, cardID, playerIndex)
 }
 
 // refillHands repõe as mãos até o tamanho máximo

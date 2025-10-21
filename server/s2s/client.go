@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"pingpong/server/protocol"
-)
+	"strings"
+	"time")
 
 // ForwardAction retransmite a ação de um jogador (ex: jogar uma carta) para o servidor do oponente.
 func ForwardAction(opponentServer, matchID, playerID, cardID string) {
@@ -18,9 +20,18 @@ func ForwardAction(opponentServer, matchID, playerID, cardID string) {
 	}
 	jsonPayload, _ := json.Marshal(payload)
 
-	// Construir URL e enviar request
-	url := fmt.Sprintf("%s/matches/%s/action", opponentServer, matchID)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+	// Construir URL usando o nome do serviço ao invés do IP
+	url := fmt.Sprintf("http://server-%s:8000/matches/%s/action", 
+		strings.TrimPrefix(opponentServer, "http://server-"),
+		matchID)
+
+	// Configurar cliente HTTP com timeout
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	// Enviar request
+	resp, err := client.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
 	if err != nil {
 		log.Printf("[S2S] Falha ao retransmitir a ação para %s: %v", url, err)
 		return
@@ -28,7 +39,9 @@ func ForwardAction(opponentServer, matchID, playerID, cardID string) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[S2S] Erro ao retransmitir ação: status code %d", resp.StatusCode)
+		// Ler o corpo do erro para mais detalhes
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("[S2S] Erro ao retransmitir ação: status code %d - %s", resp.StatusCode, string(body))
 	}
 }
 

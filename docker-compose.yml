@@ -17,7 +17,7 @@ services:
     environment:
       - LISTEN_ADDR=:9000
       - API_ADDR=:8000
-      - ALL_SERVERS=http://server-1:8000,http://server-2:8001,http://server-3:8002
+      - ALL_SERVERS=http://server-1:8000,http://server-2:8000,http://server-3:8000
 
   server-2:
     build:
@@ -30,11 +30,11 @@ services:
       - game-net
     ports:
       - "9001:9000"
-      - "8001:8001"
+      - "8001:8000"
     environment:
       - LISTEN_ADDR=:9000
-      - API_ADDR=:8001
-      - ALL_SERVERS=http://server-1:8000,http://server-2:8001,http://server-3:8002
+      - API_ADDR=:8000
+      - ALL_SERVERS=http://server-1:8000,http://server-2:8000,http://server-3:8000
 
   server-3:
     build:
@@ -47,11 +47,11 @@ services:
       - game-net
     ports:
       - "9002:9000"
-      - "8002:8002"
+      - "8002:8000"
     environment:
       - LISTEN_ADDR=:9000
-      - API_ADDR=:8002
-      - ALL_SERVERS=http://server-1:8000,http://server-2:8001,http://server-3:8002
+      - API_ADDR=:8000
+      - ALL_SERVERS=http://server-1:8000,http://server-2:8000,http://server-3:8000
 
   # --- Serviço de Cliente para Testes ---
   # Pode escalar este serviço para ter múltiplos clientes
