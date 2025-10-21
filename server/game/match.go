@@ -77,8 +77,28 @@ func (m *Match) DealInitialHands() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.Hands[0] = m.CardDB.GenerateHand(HandSize)
-	m.Hands[1] = m.CardDB.GenerateHand(HandSize)
+	// Verifica se é uma partida distribuída
+	_, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
+
+	// Em uma partida distribuída, cada servidor só gera cartas para seu jogador local
+	if isDistributed {
+		// Se o P1 está neste servidor
+		if m.informer.IsPlayerOnline(m.P1.ID) {
+			m.Hands[0] = m.CardDB.GenerateHand(HandSize)
+			log.Printf("[MATCH %s] Servidor gerou mão inicial para P1 (local)", m.ID)
+		}
+
+		// Se o P2 está neste servidor
+		if m.informer.IsPlayerOnline(m.P2.ID) {
+			m.Hands[1] = m.CardDB.GenerateHand(HandSize)
+			log.Printf("[MATCH %s] Servidor gerou mão inicial para P2 (local)", m.ID)
+		}
+	} else {
+		// Para partidas locais, gera para ambos
+		m.Hands[0] = m.CardDB.GenerateHand(HandSize)
+		m.Hands[1] = m.CardDB.GenerateHand(HandSize)
+		log.Printf("[MATCH %s] Servidor gerou mãos iniciais para partida local", m.ID)
+	}
 }
 
 // GetPlayerIndex retorna o índice do jogador (0 ou 1)
@@ -244,11 +264,40 @@ func (m *Match) removeCardFromHand(playerIndex int, cardID string) {
 
 // refillHands repõe as mãos até o tamanho máximo
 func (m *Match) refillHands() {
-	for playerIndex := 0; playerIndex < 2; playerIndex++ {
-		for len(m.Hands[playerIndex]) < HandSize {
-			newCard := m.CardDB.GetRandomCard()
-			if newCard != "" {
-				m.Hands[playerIndex] = append(m.Hands[playerIndex], newCard)
+	// Verifica se é uma partida distribuída
+	_, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
+
+	// Em uma partida distribuída, cada servidor só repõe cartas para seu jogador local
+	if isDistributed {
+		// Se o P1 está neste servidor
+		if m.informer.IsPlayerOnline(m.P1.ID) {
+			for len(m.Hands[0]) < HandSize {
+				newCard := m.CardDB.GetRandomCard()
+				if newCard != "" {
+					m.Hands[0] = append(m.Hands[0], newCard)
+					log.Printf("[MATCH %s] Servidor repôs carta para P1 (local): %s", m.ID, newCard)
+				}
+			}
+		}
+
+		// Se o P2 está neste servidor
+		if m.informer.IsPlayerOnline(m.P2.ID) {
+			for len(m.Hands[1]) < HandSize {
+				newCard := m.CardDB.GetRandomCard()
+				if newCard != "" {
+					m.Hands[1] = append(m.Hands[1], newCard)
+					log.Printf("[MATCH %s] Servidor repôs carta para P2 (local): %s", m.ID, newCard)
+				}
+			}
+		}
+	} else {
+		// Para partidas locais, repõe para ambos
+		for playerIndex := 0; playerIndex < 2; playerIndex++ {
+			for len(m.Hands[playerIndex]) < HandSize {
+				newCard := m.CardDB.GetRandomCard()
+				if newCard != "" {
+					m.Hands[playerIndex] = append(m.Hands[playerIndex], newCard)
+				}
 			}
 		}
 	}
@@ -355,16 +404,28 @@ func (m *Match) BroadcastState() {
 		}
 	}
 
-	// Garante que as mãos estão atualizadas
-	if len(m.Hands[0]) < 5 {
-		m.refillHands()
-	}
-	if len(m.Hands[1]) < 5 {
-		m.refillHands()
+	// Verifica se é uma partida distribuída
+	_, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
+
+	// Garante que as mãos estão atualizadas apenas para jogadores locais
+	if !isDistributed {
+		// Em partidas locais, atualiza ambas as mãos
+		if len(m.Hands[0]) < 5 || len(m.Hands[1]) < 5 {
+			m.refillHands()
+		}
+	} else {
+		// Em partidas distribuídas, atualiza apenas jogadores locais
+		if m.informer.IsPlayerOnline(m.P1.ID) && len(m.Hands[0]) < 5 {
+			m.refillHands()
+		}
+		if m.informer.IsPlayerOnline(m.P2.ID) && len(m.Hands[1]) < 5 {
+			m.refillHands()
+		}
 	}
 
-	log.Printf("[MATCH %s] Estado atual - P1 Hand: %v, P2 Hand: %v",
-		m.ID, m.Hands[0], m.Hands[1])
+	log.Printf("[MATCH %s] Estado atual - P1 Hand (local=%v): %v, P2 Hand (local=%v): %v",
+		m.ID, m.informer.IsPlayerOnline(m.P1.ID), m.Hands[0],
+		m.informer.IsPlayerOnline(m.P2.ID), m.Hands[1])
 
 	// Para P1
 	p1Msg := protocol.ServerMsg{
