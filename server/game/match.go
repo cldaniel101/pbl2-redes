@@ -7,6 +7,7 @@ import (
 	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
 	"pingpong/server/s2s"
+	"strings"
 	"sync"
 	"time"
 )
@@ -227,7 +228,7 @@ func (m *Match) removeCardFromHand(playerIndex int, cardID string) {
 			return
 		}
 	}
-	
+
 	log.Printf("[MATCH %s] Aviso: tentativa de remover carta %s que não está na mão do jogador %d", m.ID, cardID, playerIndex)
 }
 
@@ -462,6 +463,7 @@ func (m *Match) sendToPlayerSmart(playerID string, msg protocol.ServerMsg) {
 // forwardPlayIfNeeded verifica se uma jogada precisa ser retransmitida para um oponente
 // em outro servidor e, se for o caso, executa a retransmissão.
 func (m *Match) forwardPlayIfNeeded(playerID, cardID string) {
+	// Obter informações da partida distribuída
 	distMatch, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
 	if !isDistributed {
 		return // Não faz nada em partidas locais
@@ -471,18 +473,21 @@ func (m *Match) forwardPlayIfNeeded(playerID, cardID string) {
 	// Apenas retransmitimos jogadas de jogadores locais.
 	isPlayerLocal := m.informer.IsPlayerOnline(playerID)
 	if !isPlayerLocal {
+		log.Printf("[MATCH %s] Não retransmitindo jogada de %s pois não é local", m.ID, playerID)
 		return
 	}
 
-	// Determina o servidor do oponente.
+	// Determina o servidor do oponente usando o nome de serviço correto
 	var opponentServer string
 	if distMatch.HostPlayer == playerID {
-		opponentServer = distMatch.GuestServer
+		opponentServer = fmt.Sprintf("http://server-%s:8000", strings.TrimPrefix(distMatch.GuestServer, "http://server-"))
 	} else {
-		opponentServer = distMatch.HostServer
+		opponentServer = fmt.Sprintf("http://server-%s:8000", strings.TrimPrefix(distMatch.HostServer, "http://server-"))
 	}
 
-	log.Printf("[MATCH %s] Retransmitindo jogada do jogador local %s para o servidor do oponente em %s", m.ID, playerID, opponentServer)
+	log.Printf("[MATCH %s] Retransmitindo jogada do jogador local %s (carta %s) para o servidor do oponente em %s",
+		m.ID, playerID, cardID, opponentServer)
+
 	s2s.ForwardAction(opponentServer, m.ID, playerID, cardID)
 }
 

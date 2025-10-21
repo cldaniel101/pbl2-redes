@@ -8,22 +8,23 @@ import (
 	"log"
 	"net/http"
 	"pingpong/server/protocol"
-	"strings"
-	"time")
+	"time"
+)
 
 // ForwardAction retransmite a ação de um jogador (ex: jogar uma carta) para o servidor do oponente.
 func ForwardAction(opponentServer, matchID, playerID, cardID string) {
 	// Garantir que todos os campos necessários estejam presentes
 	payload := map[string]string{
-		"playerId": playerID, // ID real do jogador (NÃO usar RemoteAddr)
-		"cardId":   cardID,   // ID da carta a ser jogada
+		"playerId": playerID, // ID real do jogador que fez a jogada
+		"cardId":   cardID,   // ID da carta jogada
 	}
 	jsonPayload, _ := json.Marshal(payload)
 
-	// Construir URL usando o nome do serviço ao invés do IP
-	url := fmt.Sprintf("http://server-%s:8000/matches/%s/action", 
-		strings.TrimPrefix(opponentServer, "http://server-"),
-		matchID)
+	// Construir URL do endpoint no servidor do oponente
+	url := fmt.Sprintf("%s/matches/%s/action", opponentServer, matchID)
+
+	// Log para debug
+	log.Printf("[S2S] Enviando jogada do jogador %s com carta %s para %s", playerID, cardID, url)
 
 	// Configurar cliente HTTP com timeout
 	client := &http.Client{
@@ -42,6 +43,8 @@ func ForwardAction(opponentServer, matchID, playerID, cardID string) {
 		// Ler o corpo do erro para mais detalhes
 		body, _ := io.ReadAll(resp.Body)
 		log.Printf("[S2S] Erro ao retransmitir ação: status code %d - %s", resp.StatusCode, string(body))
+	} else {
+		log.Printf("[S2S] Jogada retransmitida com sucesso para %s", url)
 	}
 }
 
