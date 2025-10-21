@@ -11,12 +11,14 @@ import (
 
 // ForwardAction retransmite a ação de um jogador (ex: jogar uma carta) para o servidor do oponente.
 func ForwardAction(opponentServer, matchID, playerID, cardID string) {
+	// Garantir que todos os campos necessários estejam presentes
 	payload := map[string]string{
-		"playerId": playerID,
-		"cardId":   cardID,
+		"playerId": playerID, // ID real do jogador (NÃO usar RemoteAddr)
+		"cardId":   cardID,   // ID da carta a ser jogada
 	}
 	jsonPayload, _ := json.Marshal(payload)
 
+	// Construir URL e enviar request
 	url := fmt.Sprintf("%s/matches/%s/action", opponentServer, matchID)
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
 	if err != nil {
