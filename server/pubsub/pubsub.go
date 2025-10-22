@@ -1,6 +1,7 @@
 package pubsub
 
 import (
+	"log"
 	"sync"
 )
 
@@ -33,7 +34,7 @@ func (b *Broker) Subscribe(topic string) Subscriber {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	sub := make(Subscriber, 1) // Buffered channel
+	sub := make(Subscriber, 100) // Buffered channel com capacidade maior para evitar perda de mensagens
 	b.subscribers[sub] = true
 
 	if b.topics[topic] == nil {
@@ -78,8 +79,9 @@ func (b *Broker) Publish(topic string, payload interface{}) {
 		case sub <- msg:
 		default:
 			// O assinante não está pronto para receber.
-			// Dependendo do caso de uso, pode-se logar, descartar ou
-			// tentar reenviar mais tarde. Por enquanto, vamos descartar.
+			// Loga quando mensagens são descartadas para facilitar debug.
+			log.Printf("[PUBSUB] ⚠️ Mensagem descartada no tópico '%s' - canal do subscriber cheio (buffer: %d/%d)",
+				topic, len(sub), cap(sub))
 		}
 	}
 }

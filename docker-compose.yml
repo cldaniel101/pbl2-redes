@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # --- Cluster de Servidores do Jogo ---
   server-1:
@@ -29,8 +27,8 @@ services:
     networks:
       - game-net
     ports:
-      - "9001:9000"
-      - "8001:8000"
+      - "9003:9000"
+      - "8003:8000"
     environment:
       - LISTEN_ADDR=:9000
       - API_ADDR=:8000

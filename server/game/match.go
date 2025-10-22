@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"pingpong/server/consensus"
 	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
 	"pingpong/server/s2s"
@@ -45,6 +46,12 @@ type Match struct {
 	done     chan bool
 	broker   *pubsub.Broker
 	informer StateInformer
+
+	// Campos para o sistema de consenso distribuído
+	OperationQueue *consensus.OperationQueue  // Fila de operações ordenada por timestamp vetorial
+	VectorClock    *consensus.VectorialClock  // Relógio vetorial da partida
+	PendingACKs    map[string]map[string]bool // operationID -> {serverID -> acked}
+	ackMu          sync.RWMutex               // Mutex para PendingACKs
 }
 
 // NewMatch cria uma nova partida
@@ -63,6 +70,11 @@ func NewMatch(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pu
 		done:     make(chan bool, 1),
 		broker:   broker,
 		informer: informer,
+
+		// Inicializa estruturas de consenso
+		OperationQueue: consensus.NewOperationQueue(),
+		VectorClock:    nil, // Será inicializado pelo StateManager para partidas distribuídas
+		PendingACKs:    make(map[string]map[string]bool),
 	}
 
 	// Gera mãos iniciais
@@ -119,7 +131,7 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 		} else {
 			return fmt.Errorf("índice de carta inválido")
 		}
-	} 
+	}
 
 	// Valida se a carta existe no CardDB
 	if !m.CardDB.ValidateCard(cardID) {
@@ -563,4 +575,130 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ========================================
+// Métodos para Sistema de Consenso
+// ========================================
+
+// InitializeConsensus inicializa o relógio vetorial e estruturas de consenso
+// Deve ser chamado pelo StateManager ao criar partidas distribuídas
+func (m *Match) InitializeConsensus(serverID string, allServerIDs []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.VectorClock == nil {
+		m.VectorClock = consensus.NewVectorialClock(serverID, allServerIDs)
+		log.Printf("[MATCH %s] Sistema de consenso inicializado com relógio vetorial: %s",
+			m.ID, m.VectorClock.ToString())
+	}
+}
+
+// AddPendingACK registra que uma operação está aguardando ACKs
+func (m *Match) AddPendingACK(operationID string, serverIDs []string) {
+	m.ackMu.Lock()
+	defer m.ackMu.Unlock()
+
+	if m.PendingACKs[operationID] == nil {
+		m.PendingACKs[operationID] = make(map[string]bool)
+	}
+
+	// Inicializa todos os servidores como não confirmados
+	for _, serverID := range serverIDs {
+		m.PendingACKs[operationID][serverID] = false
+	}
+
+	log.Printf("[MATCH %s] Operação %s aguardando ACKs de %v", m.ID, operationID, serverIDs)
+}
+
+// MarkACK marca que um servidor confirmou uma operação
+// Retorna true se todos os ACKs foram recebidos
+func (m *Match) MarkACK(operationID, serverID string) bool {
+	m.ackMu.Lock()
+	defer m.ackMu.Unlock()
+
+	if acks, exists := m.PendingACKs[operationID]; exists {
+		acks[serverID] = true
+
+		// Verifica se todos os servidores confirmaram
+		allAcked := true
+		for _, acked := range acks {
+			if !acked {
+				allAcked = false
+				break
+			}
+		}
+
+		if allAcked {
+			log.Printf("[MATCH %s] Operação %s recebeu todos os ACKs", m.ID, operationID)
+			delete(m.PendingACKs, operationID)
+			return true
+		}
+	}
+
+	return false
+}
+
+// GetPendingACKCount retorna o número de operações aguardando ACKs
+func (m *Match) GetPendingACKCount() int {
+	m.ackMu.RLock()
+	defer m.ackMu.RUnlock()
+
+	return len(m.PendingACKs)
+}
+
+// CreatePlayOperation cria uma operação de jogada com timestamp vetorial
+func (m *Match) CreatePlayOperation(playerID, cardID string) *consensus.Operation {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Se não há relógio vetorial, retorna nil (partida não distribuída)
+	if m.VectorClock == nil {
+		return nil
+	}
+
+	// Incrementa o relógio vetorial
+	m.VectorClock.Tick()
+
+	// Cria a operação
+	op := consensus.NewOperation(
+		consensus.OpTypePlay,
+		m.ID,
+		m.VectorClock.ToString(), // Usa o toString como ServerID temporariamente
+		playerID,
+		cardID,
+		m.VectorClock.GetSnapshot(),
+	)
+
+	// Adiciona à fila de operações
+	m.OperationQueue.Add(op)
+
+	log.Printf("[MATCH %s] Operação de jogada criada: %s", m.ID, op.ToString())
+
+	return op
+}
+
+// ProcessOperation processa uma operação da fila
+func (m *Match) ProcessOperation() *consensus.Operation {
+	// Pega a próxima operação (sem remover)
+	op := m.OperationQueue.GetTop()
+	if op == nil {
+		return nil
+	}
+
+	// Aqui seria verificado se a operação pode ser executada
+	// (se todos os ACKs foram recebidos, etc.)
+	// Por enquanto, apenas retorna a operação
+
+	return op
+}
+
+// RemoveOperation remove uma operação da fila após processamento
+func (m *Match) RemoveOperation() *consensus.Operation {
+	return m.OperationQueue.Remove()
+}
+
+// GetOperationQueueSize retorna o tamanho da fila de operações
+func (m *Match) GetOperationQueueSize() int {
+	return m.OperationQueue.Size()
 }

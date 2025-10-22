@@ -60,7 +60,7 @@ Para interagir com a aplicação, você pode se conectar a uma sessão interativ
 
 4. **No segundo terminal**, conecte-se ao segundo cliente:
    ```bash
-   docker run -it --rm --env SERVER_ADDR="host.docker.internal:9001" pingpong-client:latest
+   docker run -it --rm --env SERVER_ADDR="host.docker.internal:9000" pingpong-client:latest
    ```
 
 5. **Agora você pode**:
