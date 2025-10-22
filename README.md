@@ -38,7 +38,7 @@ Certifique-se de ter o Docker e o Docker Compose instalados em sua máquina.
    O comando a seguir irá construir as imagens, iniciar 1 contêiner para o servidor e 2 contêineres para os clientes em modo "detached" (em segundo plano).
 
    ```bash
-   docker compose up --build --scale client=2 -d
+   docker compose up --build -d
    ```
 
 ## Testando a Aplicação
@@ -60,7 +60,7 @@ Para interagir com a aplicação, você pode se conectar a uma sessão interativ
 
 4. **No segundo terminal**, conecte-se ao segundo cliente:
    ```bash
-   docker attach pbl2-redes-client-2
+   docker run -it --rm --env SERVER_ADDR="host.docker.internal:9001" pingpong-client:latest
    ```
 
 5. **Agora você pode**:
