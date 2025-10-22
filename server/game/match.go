@@ -110,10 +110,7 @@ func (m *Match) GetOpponentIndex(playerID string) int {
 
 // PlayCard registra uma carta jogada por um jogador
 func (m *Match) PlayCard(playerID, cardID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Valida se o jogador está na partida
+	// Valida se o jogador está na partida (sem lock ainda)
 	playerIndex := -1
 	if m.P1.ID == playerID {
 		playerIndex = 0
@@ -124,25 +121,35 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 	}
 
 	// Se a entrada é um índice (1-5), converte para o ID da carta
+	m.mu.Lock()
 	if len(cardID) == 1 && cardID[0] >= '1' && cardID[0] <= '5' {
 		cardIndex := int(cardID[0] - '1')
 		if cardIndex >= 0 && cardIndex < len(m.Hands[playerIndex]) {
 			cardID = m.Hands[playerIndex][cardIndex]
 		} else {
+			m.mu.Unlock()
 			return fmt.Errorf("índice de carta inválido")
 		}
 	}
 
 	// Valida se a carta existe no CardDB
 	if !m.CardDB.ValidateCard(cardID) {
+		m.mu.Unlock()
 		return fmt.Errorf("carta inválida")
 	}
+	m.mu.Unlock()
 
-	// Se a partida for distribuída, retransmite a jogada para o outro servidor
-	// ANTES de registrar a jogada localmente.
-	m.forwardPlayIfNeeded(playerID, cardID)
+	// Verifica se é uma partida distribuída
+	if m.VectorClock != nil {
+		// Usa Two-Phase Commit para partidas distribuídas
+		return m.playCardWithConsensus(playerID, cardID)
+	}
 
-	// Registra a jogada e remove a carta da mão
+	// Partida local - usa lógica simples
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Registra a jogada
 	m.Waiting[playerID] = cardID
 
 	// Verifica se ambos jogaram
@@ -152,6 +159,96 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 	}
 
 	return nil
+}
+
+// playCardWithConsensus implementa Two-Phase Commit para jogadas em partidas distribuídas
+func (m *Match) playCardWithConsensus(playerID, cardID string) error {
+	// Fase 1: Criar operação e propor
+	op := m.CreatePlayOperation(playerID, cardID)
+	if op == nil {
+		return fmt.Errorf("falha ao criar operação (partida não distribuída)")
+	}
+
+	// Obtém informações da partida distribuída
+	distMatch, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
+	if !isDistributed {
+		return fmt.Errorf("partida não é distribuída")
+	}
+
+	// Determina outros servidores para propor
+	var otherServers []string
+
+	// Identifica qual servidor somos baseado no jogador local
+	isHostServer := m.informer.IsPlayerOnline(distMatch.HostPlayer)
+
+	if isHostServer {
+		// Somos o servidor host, propõe para o guest
+		otherServers = []string{distMatch.GuestServer}
+	} else {
+		// Somos o servidor guest, propõe para o host
+		otherServers = []string{distMatch.HostServer}
+	}
+
+	log.Printf("[MATCH %s] Iniciando consenso para operação %s com servidores: %v", m.ID, op.ID, otherServers)
+
+	// Propõe operação (Fase 1)
+	ackChan, errChan := m.proposeOperation(op, otherServers)
+
+	// Aguarda resultado
+	select {
+	case <-ackChan:
+		// Todos os ACKs recebidos, prossegue para Fase 2
+		log.Printf("[MATCH %s] Todos os ACKs recebidos para operação %s", m.ID, op.ID)
+
+		// Fase 2: Verificação cross-server
+		allValid := true
+		for _, serverAddr := range otherServers {
+			valid, err := s2s.CheckOperation(serverAddr, m.ID, op)
+			if err != nil || !valid {
+				log.Printf("[MATCH %s] Operação %s inválida no servidor %s: %v", m.ID, op.ID, serverAddr, err)
+				allValid = false
+				break
+			}
+		}
+
+		if allValid {
+			// Executa localmente
+			if err := m.ExecuteOperation(op); err != nil {
+				log.Printf("[MATCH %s] Erro ao executar operação %s localmente: %v", m.ID, op.ID, err)
+				return err
+			}
+
+			// Solicita commit nos outros servidores
+			for _, serverAddr := range otherServers {
+				go s2s.CommitOperation(serverAddr, m.ID, op)
+			}
+
+			log.Printf("[MATCH %s] Operação %s executada com sucesso via consenso", m.ID, op.ID)
+			return nil
+		} else {
+			// Operação inválida, faz rollback
+			m.RollbackOperation(op)
+
+			// Solicita rollback nos outros servidores
+			for _, serverAddr := range otherServers {
+				go s2s.RollbackOperation(serverAddr, m.ID, op)
+			}
+
+			return fmt.Errorf("operação rejeitada pelo consenso (inválida em um ou mais servidores)")
+		}
+
+	case err := <-errChan:
+		// Timeout ou erro aguardando ACKs
+		log.Printf("[MATCH %s] Erro no consenso para operação %s: %v", m.ID, op.ID, err)
+		m.RollbackOperation(op)
+
+		// Solicita rollback nos outros servidores
+		for _, serverAddr := range otherServers {
+			go s2s.RollbackOperation(serverAddr, m.ID, op)
+		}
+
+		return fmt.Errorf("consenso falhou: %v", err)
+	}
 }
 
 // resolveRound resolve uma rodada quando ambos jogadores jogaram
@@ -477,8 +574,10 @@ func (m *Match) sendToPlayerSmart(playerID string, msg protocol.ServerMsg) {
 	}
 }
 
-// forwardPlayIfNeeded verifica se uma jogada precisa ser retransmitida para um oponente
-// em outro servidor e, se for o caso, executa a retransmissão.
+// forwardPlayIfNeeded foi substituído pelo sistema de consenso Two-Phase Commit
+// O método playCardWithConsensus() agora gerencia a sincronização entre servidores
+// DEPRECADO: Este método não é mais usado
+/*
 func (m *Match) forwardPlayIfNeeded(playerID, cardID string) {
 	// Obter informações da partida distribuída
 	distMatch, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
@@ -508,6 +607,7 @@ func (m *Match) forwardPlayIfNeeded(playerID, cardID string) {
 
 	s2s.ForwardAction(opponentServer, m.ID, playerID, cardID)
 }
+*/
 
 // scheduleAutoPlay agenda o auto-play se necessário
 func (m *Match) scheduleAutoPlay() {
@@ -701,4 +801,217 @@ func (m *Match) RemoveOperation() *consensus.Operation {
 // GetOperationQueueSize retorna o tamanho da fila de operações
 func (m *Match) GetOperationQueueSize() int {
 	return m.OperationQueue.Size()
+}
+
+// ========================================
+// Métodos do Two-Phase Commit
+// ========================================
+
+// proposeOperation propõe uma operação para outros servidores (Fase 1)
+// Retorna canais para aguardar ACKs e resultado da validação
+func (m *Match) proposeOperation(op *consensus.Operation, otherServers []string) (ackChan chan bool, errChan chan error) {
+	ackChan = make(chan bool, 1)
+	errChan = make(chan error, 1)
+
+	go func() {
+		// Adiciona operação na fila local
+		m.OperationQueue.Add(op)
+
+		// Registra operação como pendente de ACKs
+		m.AddPendingACK(op.ID, otherServers)
+
+		log.Printf("[MATCH %s] Propondo operação %s para %v", m.ID, op.ID, otherServers)
+
+		// Envia proposta para outros servidores
+		for _, serverAddr := range otherServers {
+			go s2s.ProposeOperation(serverAddr, m.ID, op)
+		}
+
+		// Aguarda ACKs com timeout
+		allACKsReceived := m.waitForACKs(op.ID, 5*time.Second)
+
+		if !allACKsReceived {
+			errChan <- fmt.Errorf("timeout aguardando ACKs para operação %s", op.ID)
+			return
+		}
+
+		ackChan <- true
+	}()
+
+	return ackChan, errChan
+}
+
+// waitForACKs aguarda confirmações de todos os servidores
+// Retorna true se todos confirmaram, false se timeout
+func (m *Match) waitForACKs(operationID string, timeout time.Duration) bool {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	deadline := time.Now().Add(timeout)
+
+	for {
+		select {
+		case <-ticker.C:
+			m.ackMu.RLock()
+			acks, exists := m.PendingACKs[operationID]
+			m.ackMu.RUnlock()
+
+			if !exists {
+				// Todos os ACKs foram recebidos (MarkACK já removeu)
+				return true
+			}
+
+			// Verifica se ainda há ACKs pendentes
+			allReceived := true
+			for _, acked := range acks {
+				if !acked {
+					allReceived = false
+					break
+				}
+			}
+
+			if allReceived {
+				return true
+			}
+
+			// Verifica timeout
+			if time.Now().After(deadline) {
+				log.Printf("[MATCH %s] Timeout aguardando ACKs para operação %s", m.ID, operationID)
+				return false
+			}
+		}
+	}
+}
+
+// CheckOperationValidity verifica se uma operação é válida no estado atual
+// Retorna true se a operação pode ser executada, false caso contrário
+func (m *Match) CheckOperationValidity(op *consensus.Operation) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	switch op.Type {
+	case consensus.OpTypePlay:
+		// Verifica se é uma operação de jogada
+		playerIndex := -1
+		if m.P1.ID == op.PlayerID {
+			playerIndex = 0
+		} else if m.P2.ID == op.PlayerID {
+			playerIndex = 1
+		} else {
+			return false, fmt.Errorf("jogador %s não está nesta partida", op.PlayerID)
+		}
+
+		// Verifica se a partida está aceitando jogadas
+		if m.State != StateAwaitingPlays {
+			return false, fmt.Errorf("partida não está aguardando jogadas (estado: %v)", m.State)
+		}
+
+		// Verifica se o jogador já jogou nesta rodada
+		if _, alreadyPlayed := m.Waiting[op.PlayerID]; alreadyPlayed {
+			return false, fmt.Errorf("jogador %s já jogou nesta rodada", op.PlayerID)
+		}
+
+		// Verifica se a carta é válida
+		if !m.CardDB.ValidateCard(op.CardID) {
+			return false, fmt.Errorf("carta %s é inválida", op.CardID)
+		}
+
+		// Verifica se a carta está na mão do jogador
+		cardFound := false
+		for _, handCard := range m.Hands[playerIndex] {
+			if handCard == op.CardID {
+				cardFound = true
+				break
+			}
+		}
+
+		if !cardFound {
+			return false, fmt.Errorf("carta %s não está na mão do jogador %s", op.CardID, op.PlayerID)
+		}
+
+		return true, nil
+
+	case consensus.OpTypeResolve:
+		// Verifica se ambos jogadores já jogaram
+		if len(m.Waiting) != 2 {
+			return false, fmt.Errorf("não há jogadas suficientes para resolver (apenas %d/2)", len(m.Waiting))
+		}
+		return true, nil
+
+	case consensus.OpTypeEndMatch:
+		// Verifica se o jogo terminou
+		if m.HP[0] > 0 && m.HP[1] > 0 {
+			return false, fmt.Errorf("partida ainda não terminou")
+		}
+		return true, nil
+
+	default:
+		return false, fmt.Errorf("tipo de operação desconhecido: %s", op.Type)
+	}
+}
+
+// ExecuteOperation executa uma operação após consenso (Fase 2)
+func (m *Match) ExecuteOperation(op *consensus.Operation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	log.Printf("[MATCH %s] Executando operação %s (tipo: %s)", m.ID, op.ID, op.Type)
+
+	// Atualiza o relógio vetorial com o timestamp da operação
+	if m.VectorClock != nil {
+		m.VectorClock.Update(op.Timestamp)
+	}
+
+	switch op.Type {
+	case consensus.OpTypePlay:
+		// Registra a jogada
+		m.Waiting[op.PlayerID] = op.CardID
+		log.Printf("[MATCH %s] Jogada registrada: %s jogou %s", m.ID, op.PlayerID, op.CardID)
+
+		// Remove da fila
+		m.OperationQueue.RemoveByID(op.ID)
+
+		// Verifica se ambos jogaram
+		if len(m.Waiting) == 2 {
+			// Resolve a rodada
+			go m.resolveRound()
+		}
+
+		return nil
+
+	case consensus.OpTypeResolve:
+		// Já implementado em resolveRound()
+		return nil
+
+	case consensus.OpTypeEndMatch:
+		m.State = StateEnded
+		return nil
+
+	default:
+		return fmt.Errorf("tipo de operação desconhecido: %s", op.Type)
+	}
+}
+
+// RollbackOperation descarta uma operação inválida
+func (m *Match) RollbackOperation(op *consensus.Operation) {
+	log.Printf("[MATCH %s] Revertendo operação %s (tipo: %s)", m.ID, op.ID, op.Type)
+
+	// Remove da fila de operações
+	m.OperationQueue.RemoveByID(op.ID)
+
+	// Remove dos ACKs pendentes
+	m.ackMu.Lock()
+	delete(m.PendingACKs, op.ID)
+	m.ackMu.Unlock()
+
+	// Notifica os jogadores se necessário
+	switch op.Type {
+	case consensus.OpTypePlay:
+		// Notifica o jogador que a jogada foi rejeitada
+		m.sendToPlayerSmart(op.PlayerID, protocol.ServerMsg{
+			T:    protocol.ERROR,
+			Code: protocol.INTERNAL,
+			Msg:  "Jogada rejeitada pelo sistema de consenso",
+		})
+	}
 }
