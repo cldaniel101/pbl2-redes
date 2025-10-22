@@ -7,7 +7,6 @@ import (
 	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
 	"pingpong/server/s2s"
-	"strings"
 	"sync"
 	"time"
 )
@@ -77,28 +76,8 @@ func (m *Match) DealInitialHands() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Verifica se é uma partida distribuída
-	_, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
-
-	// Em uma partida distribuída, cada servidor só gera cartas para seu jogador local
-	if isDistributed {
-		// Se o P1 está neste servidor
-		if m.informer.IsPlayerOnline(m.P1.ID) {
-			m.Hands[0] = m.CardDB.GenerateHand(HandSize)
-			log.Printf("[MATCH %s] Servidor gerou mão inicial para P1 (local)", m.ID)
-		}
-
-		// Se o P2 está neste servidor
-		if m.informer.IsPlayerOnline(m.P2.ID) {
-			m.Hands[1] = m.CardDB.GenerateHand(HandSize)
-			log.Printf("[MATCH %s] Servidor gerou mão inicial para P2 (local)", m.ID)
-		}
-	} else {
-		// Para partidas locais, gera para ambos
-		m.Hands[0] = m.CardDB.GenerateHand(HandSize)
-		m.Hands[1] = m.CardDB.GenerateHand(HandSize)
-		log.Printf("[MATCH %s] Servidor gerou mãos iniciais para partida local", m.ID)
-	}
+	m.Hands[0] = m.CardDB.GenerateHand(HandSize)
+	m.Hands[1] = m.CardDB.GenerateHand(HandSize)
 }
 
 // GetPlayerIndex retorna o índice do jogador (0 ou 1)
@@ -140,19 +119,7 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 		} else {
 			return fmt.Errorf("índice de carta inválido")
 		}
-	} else {
-		// Se não é um índice, valida se a carta está na mão do jogador
-		cardIndex := -1
-		for i, handCardID := range m.Hands[playerIndex] {
-			if handCardID == cardID {
-				cardIndex = i
-				break
-			}
-		}
-		if cardIndex == -1 {
-			return fmt.Errorf("carta não está na mão do jogador")
-		}
-	}
+	} 
 
 	// Valida se a carta existe no CardDB
 	if !m.CardDB.ValidateCard(cardID) {
@@ -264,40 +231,11 @@ func (m *Match) removeCardFromHand(playerIndex int, cardID string) {
 
 // refillHands repõe as mãos até o tamanho máximo
 func (m *Match) refillHands() {
-	// Verifica se é uma partida distribuída
-	_, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
-
-	// Em uma partida distribuída, cada servidor só repõe cartas para seu jogador local
-	if isDistributed {
-		// Se o P1 está neste servidor
-		if m.informer.IsPlayerOnline(m.P1.ID) {
-			for len(m.Hands[0]) < HandSize {
-				newCard := m.CardDB.GetRandomCard()
-				if newCard != "" {
-					m.Hands[0] = append(m.Hands[0], newCard)
-					log.Printf("[MATCH %s] Servidor repôs carta para P1 (local): %s", m.ID, newCard)
-				}
-			}
-		}
-
-		// Se o P2 está neste servidor
-		if m.informer.IsPlayerOnline(m.P2.ID) {
-			for len(m.Hands[1]) < HandSize {
-				newCard := m.CardDB.GetRandomCard()
-				if newCard != "" {
-					m.Hands[1] = append(m.Hands[1], newCard)
-					log.Printf("[MATCH %s] Servidor repôs carta para P2 (local): %s", m.ID, newCard)
-				}
-			}
-		}
-	} else {
-		// Para partidas locais, repõe para ambos
-		for playerIndex := 0; playerIndex < 2; playerIndex++ {
-			for len(m.Hands[playerIndex]) < HandSize {
-				newCard := m.CardDB.GetRandomCard()
-				if newCard != "" {
-					m.Hands[playerIndex] = append(m.Hands[playerIndex], newCard)
-				}
+	for playerIndex := 0; playerIndex < 2; playerIndex++ {
+		for len(m.Hands[playerIndex]) < HandSize {
+			newCard := m.CardDB.GetRandomCard()
+			if newCard != "" {
+				m.Hands[playerIndex] = append(m.Hands[playerIndex], newCard)
 			}
 		}
 	}
@@ -391,6 +329,7 @@ func (m *Match) broadcastRoundResult(p1Card, p2Card Card, p1Bonus, p2Bonus, p1Dm
 }
 
 // BroadcastState envia o estado atual para ambos jogadores
+// BroadcastState envia o estado atual para ambos jogadores
 func (m *Match) BroadcastState() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -401,25 +340,6 @@ func (m *Match) BroadcastState() {
 		deadlineMs = time.Until(m.Deadline).Milliseconds()
 		if deadlineMs < 0 {
 			deadlineMs = 0
-		}
-	}
-
-	// Verifica se é uma partida distribuída
-	_, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
-
-	// Garante que as mãos estão atualizadas apenas para jogadores locais
-	if !isDistributed {
-		// Em partidas locais, atualiza ambas as mãos
-		if len(m.Hands[0]) < 5 || len(m.Hands[1]) < 5 {
-			m.refillHands()
-		}
-	} else {
-		// Em partidas distribuídas, atualiza apenas jogadores locais
-		if m.informer.IsPlayerOnline(m.P1.ID) && len(m.Hands[0]) < 5 {
-			m.refillHands()
-		}
-		if m.informer.IsPlayerOnline(m.P2.ID) && len(m.Hands[1]) < 5 {
-			m.refillHands()
 		}
 	}
 
@@ -565,9 +485,10 @@ func (m *Match) forwardPlayIfNeeded(playerID, cardID string) {
 	// Determina o servidor do oponente usando o nome de serviço correto
 	var opponentServer string
 	if distMatch.HostPlayer == playerID {
-		opponentServer = fmt.Sprintf("http://server-%s:8000", strings.TrimPrefix(distMatch.GuestServer, "http://server-"))
+		opponentServer = distMatch.GuestServer
+		fmt.Println("\n\n\n" + opponentServer + "\n\n\n")
 	} else {
-		opponentServer = fmt.Sprintf("http://server-%s:8000", strings.TrimPrefix(distMatch.HostServer, "http://server-"))
+		opponentServer = distMatch.HostServer
 	}
 
 	log.Printf("[MATCH %s] Retransmitindo jogada do jogador local %s (carta %s) para o servidor do oponente em %s",

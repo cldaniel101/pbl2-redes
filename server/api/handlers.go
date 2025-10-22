@@ -159,21 +159,28 @@ func (s *APIServer) handleMatchAction(w http.ResponseWriter, r *http.Request) {
 
 // handleForwardMessage recebe uma mensagem de estado do servidor anfitrião e a envia para o jogador local.
 func (s *APIServer) handleForwardMessage(w http.ResponseWriter, r *http.Request) {
-	var msg protocol.ServerMsg
-	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
-		http.Error(w, "JSON inválido", http.StatusBadRequest)
-		return
-	}
+    var msg protocol.ServerMsg
+    if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+        http.Error(w, "JSON inválido", http.StatusBadRequest)
+        return
+    }
 
-	// O servidor que retransmite adiciona o ID do jogador alvo num cabeçalho.
-	playerID := r.Header.Get("X-Player-ID")
-	if playerID == "" {
-		log.Printf("[API] Não foi possível retransmitir a mensagem, ID do jogador em falta no cabeçalho X-Player-ID.")
-		http.Error(w, "ID do jogador em falta", http.StatusBadRequest)
-		return
-	}
+    // O servidor que retransmite adiciona o ID do jogador alvo num cabeçalho.
+    playerID := r.Header.Get("X-Player-ID")
+    if playerID == "" {
+        log.Printf("[API] Não foi possível retransmitir a mensagem, ID do jogador em falta no cabeçalho X-Player-ID.")
+        http.Error(w, "ID do jogador em falta", http.StatusBadRequest)
+        return
+    }
 
-	log.Printf("[API] Retransmitindo mensagem do tipo %s para o jogador %s", msg.T, playerID)
-	s.sendToPlayer(playerID, msg)
-	w.WriteHeader(http.StatusOK)
+    // Apenas encaminha a mensagem se o jogador estiver realmente online neste servidor.
+    // Isso evita que um servidor processe mensagens para jogadores que não são seus.
+    if s.stateManager.IsPlayerOnline(playerID) {
+        log.Printf("[API] Retransmitindo mensagem do tipo %s para o jogador %s", msg.T, playerID)
+        s.sendToPlayer(playerID, msg)
+    } else {
+        log.Printf("[API] Mensagem para %s ignorada, jogador não está online neste servidor.", playerID)
+    }
+
+    w.WriteHeader(http.StatusOK)
 }
