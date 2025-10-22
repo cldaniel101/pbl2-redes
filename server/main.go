@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -9,6 +10,7 @@ import (
 
 	// Importa os novos pacotes modulares
 	"pingpong/server/api"
+	"pingpong/server/consensus"
 	"pingpong/server/matchmaking"
 	"pingpong/server/network"
 	"pingpong/server/pubsub"
@@ -43,12 +45,49 @@ func main() {
 	// 2. Inicialização dos Componentes Centrais
 	stateManager := state.NewStateManager()
 	broker := pubsub.NewBroker()
-	
+
 	// Canal para o APIServer notificar o MatchmakingService quando o token chegar.
 	tokenAcquiredChan := make(chan bool, 1)
 
+	// 2.1. Configuração do Sistema de Detecção de Falhas
+	// Gera um ID único para este servidor baseado no hostname
+	serverID := fmt.Sprintf("server-%d", myIndex)
+	log.Printf("[MAIN] ID deste servidor: %s", serverID)
+
+	// Cria o sistema de detecção de falhas com configuração padrão
+	fdConfig := consensus.DefaultFailureDetectorConfig()
+	failureDetector := consensus.NewFailureDetector(serverID, fdConfig)
+
+	// Registra todos os outros servidores para monitoramento
+	for i, serverAddr := range allServers {
+		if serverAddr != thisServerAddress {
+			otherServerID := fmt.Sprintf("server-%d", i)
+			failureDetector.RegisterServer(otherServerID, serverAddr)
+			log.Printf("[MAIN] Registrado servidor %s (%s) para monitoramento", otherServerID, serverAddr)
+		}
+	}
+
+	// Configura callbacks para eventos de falha
+	failureDetector.SetOnServerFail(func(deadServerID string) {
+		log.Printf("[MAIN] 🚨 ALERTA: Servidor %s falhou!", deadServerID)
+		// Aqui pode adicionar lógica adicional quando um servidor falha
+		// Por exemplo: notificar jogadores, abortar partidas distribuídas, etc.
+	})
+
+	failureDetector.SetOnOperationFail(func(operationID, deadServerID, reason string) {
+		log.Printf("[MAIN] 🚨 ALERTA: Operação %s falhou: %s", operationID, reason)
+		// Aqui pode adicionar lógica adicional quando uma operação falha
+	})
+
+	// Inicia o sistema de detecção de falhas
+	failureDetector.Start()
+	log.Printf("[MAIN] ✓ Sistema de detecção de falhas iniciado")
+
+	// Configura o detector de falhas no StateManager
+	stateManager.SetFailureDetector(failureDetector)
+
 	// 3. Injeção de Dependências e Inicialização dos Serviços
-	
+
 	// Serviço de Matchmaking (executado em segundo plano)
 	matchmakingService := matchmaking.NewService(
 		stateManager,
@@ -66,6 +105,8 @@ func main() {
 		tokenAcquiredChan,
 		thisServerAddress,
 	)
+	// Configura o detector de falhas no API Server
+	apiServer.SetFailureDetector(failureDetector)
 
 	// Servidor TCP (para comunicação com os clientes)
 	tcpServer := network.NewTCPServer(

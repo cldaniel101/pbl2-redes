@@ -20,6 +20,8 @@ type APIServer struct {
 	// O canal de token é injetado para que o handler possa notificar
 	// o serviço de matchmaking quando o token for recebido.
 	tokenAcquiredChan chan<- bool
+	// Sistema de detecção de falhas
+	failureDetector *consensus.FailureDetector
 }
 
 // NewServer cria uma nova instância do servidor da API.
@@ -29,7 +31,13 @@ func NewServer(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan<- b
 		broker:            broker,
 		tokenAcquiredChan: tokenChan,
 		serverAddr:        serverAddr,
+		failureDetector:   nil, // Será configurado externamente
 	}
+}
+
+// SetFailureDetector configura o sistema de detecção de falhas
+func (s *APIServer) SetFailureDetector(fd *consensus.FailureDetector) {
+	s.failureDetector = fd
 }
 
 // Router configura e retorna um novo router HTTP com todos os endpoints da API.
@@ -43,6 +51,12 @@ func (s *APIServer) Router() http.Handler {
 
 	// Endpoints do sistema de consenso
 	mux.HandleFunc("/api/matches/", s.handleConsensusEndpoints)
+
+	// Endpoint de health check para o sistema de heartbeat
+	mux.HandleFunc("/api/health", s.handleHealthCheck)
+
+	// Endpoint de status do detector de falhas (debug)
+	mux.HandleFunc("/api/failure-detector/status", s.handleFailureDetectorStatus)
 
 	return mux
 }
@@ -389,4 +403,78 @@ func (s *APIServer) handleRollback(w http.ResponseWriter, r *http.Request, match
 	match.RollbackOperation(&op)
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// ========================================
+// Endpoints do Sistema de Detecção de Falhas
+// ========================================
+
+// handleHealthCheck responde aos pings de heartbeat de outros servidores
+func (s *APIServer) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Decodifica o ping (contém o ID do servidor que está pingando)
+	var ping struct {
+		ServerID string `json:"serverId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&ping); err != nil {
+		// Se não conseguir decodificar, aceita mesmo assim (ping simples)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "ok",
+		})
+		return
+	}
+
+	// Registra o heartbeat no detector de falhas
+	if s.failureDetector != nil && ping.ServerID != "" {
+		s.failureDetector.RecordHeartbeat(ping.ServerID)
+		log.Printf("[API] ❤️ Heartbeat recebido de %s", ping.ServerID)
+	}
+
+	// Responde com status OK
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "ok",
+	})
+}
+
+// handleFailureDetectorStatus retorna o status do sistema de detecção de falhas (debug)
+func (s *APIServer) handleFailureDetectorStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.failureDetector == nil {
+		http.Error(w, "Sistema de detecção de falhas não configurado", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Coleta informações do sistema
+	stats := s.failureDetector.GetStats()
+	aliveServers := s.failureDetector.GetAliveServers()
+	deadServers := s.failureDetector.GetDeadServers()
+	allServersStatus := s.failureDetector.GetAllServersStatus()
+	activeOps := s.failureDetector.GetActiveOperations()
+	failedOps := s.failureDetector.GetFailedOperations()
+
+	// Prepara resposta
+	response := map[string]interface{}{
+		"stats":         stats,
+		"aliveServers":  aliveServers,
+		"deadServers":   deadServers,
+		"serversStatus": allServersStatus,
+		"activeOps":     activeOps,
+		"failedOps":     failedOps,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+
+	log.Printf("[API] Status do detector de falhas consultado")
 }

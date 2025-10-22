@@ -48,10 +48,11 @@ type Match struct {
 	informer StateInformer
 
 	// Campos para o sistema de consenso distribuído
-	OperationQueue *consensus.OperationQueue  // Fila de operações ordenada por timestamp vetorial
-	VectorClock    *consensus.VectorialClock  // Relógio vetorial da partida
-	PendingACKs    map[string]map[string]bool // operationID -> {serverID -> acked}
-	ackMu          sync.RWMutex               // Mutex para PendingACKs
+	OperationQueue  *consensus.OperationQueue  // Fila de operações ordenada por timestamp vetorial
+	VectorClock     *consensus.VectorialClock  // Relógio vetorial da partida
+	PendingACKs     map[string]map[string]bool // operationID -> {serverID -> acked}
+	ackMu           sync.RWMutex               // Mutex para PendingACKs
+	FailureDetector *consensus.FailureDetector // Sistema de detecção de falhas (opcional)
 }
 
 // NewMatch cria uma nova partida
@@ -836,6 +837,14 @@ func (m *Match) InitializeConsensus(serverID string, allServerIDs []string) {
 	}
 }
 
+// SetFailureDetector configura o sistema de detecção de falhas para a partida
+func (m *Match) SetFailureDetector(fd *consensus.FailureDetector) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.FailureDetector = fd
+	log.Printf("[MATCH %s] Sistema de detecção de falhas configurado", m.ID)
+}
+
 // AddPendingACK registra que uma operação está aguardando ACKs
 func (m *Match) AddPendingACK(operationID string, serverIDs []string) {
 	m.ackMu.Lock()
@@ -964,6 +973,21 @@ func (m *Match) proposeOperation(op *consensus.Operation, otherServers []string)
 
 		log.Printf("[MATCH %s] [2PC] Propondo operação %s para %v", m.ID, op.ID, otherServers)
 
+		// Se o FailureDetector está disponível, inicia monitoramento com timeout automático
+		if m.FailureDetector != nil {
+			// Rastreia operação com os servidores envolvidos
+			m.FailureDetector.TrackOperation(op.ID, otherServers)
+
+			// Configura timeout com rollback automático
+			timeout := time.Duration(ConsensusACKTimeout) * time.Millisecond
+			m.FailureDetector.WatchACKs(op.ID, otherServers, timeout, func(opID, reason string) {
+				// Rollback automático em caso de timeout
+				log.Printf("[MATCH %s] [2PC] ⏱️ Timeout automático para operação %s: %s", m.ID, opID, reason)
+				m.RollbackOperation(op)
+				errChan <- fmt.Errorf("%s", reason)
+			})
+		}
+
 		// Envia proposta para outros servidores (paralelo)
 		for _, serverAddr := range otherServers {
 			go func(addr string) {
@@ -977,8 +1001,17 @@ func (m *Match) proposeOperation(op *consensus.Operation, otherServers []string)
 		timeout := time.Duration(ConsensusACKTimeout) * time.Millisecond
 		allACKsReceived := m.waitForACKs(op.ID, timeout)
 
+		// Cancela o timeout do FailureDetector se todos os ACKs foram recebidos
+		if allACKsReceived && m.FailureDetector != nil {
+			m.FailureDetector.AllACKsReceived(op.ID)
+		}
+
 		if !allACKsReceived {
-			errChan <- fmt.Errorf("timeout aguardando ACKs para operação %s (timeout: %dms)", op.ID, ConsensusACKTimeout)
+			// Se não há FailureDetector, reporta erro manualmente
+			if m.FailureDetector == nil {
+				errChan <- fmt.Errorf("timeout aguardando ACKs para operação %s (timeout: %dms)", op.ID, ConsensusACKTimeout)
+			}
+			// Se há FailureDetector, o callback já foi acionado
 			return
 		}
 

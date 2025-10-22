@@ -31,6 +31,10 @@ type StateManager struct {
 	MatchmakingQueue   []*protocol.PlayerConn
 	ActiveMatches      map[string]*game.Match
 	DistributedMatches map[string]*DistributedMatch
+	// Sistema de detecção de falhas (opcional, configurado externamente)
+	failureDetector interface {
+		IsServerAlive(serverID string) bool
+	}
 }
 
 // NewStateManager cria e inicializa um novo gerenciador de estado.
@@ -226,7 +230,7 @@ func (sm *StateManager) ConfirmAndCreateDistributedMatch(matchID, guestPlayerID,
 	// for necessário um objeto Match no servidor convidado, mas pode ser útil).
 	hostPlayerConn := protocol.NewPlayerConn(hostPlayerID, nil)
 	match := game.NewMatch(matchID, hostPlayerConn, guestPlayer, sm.CardDB, broker, sm) // Broker é nil aqui
-	sm.ActiveMatches[matchID] = match	
+	sm.ActiveMatches[matchID] = match
 
 	log.Printf("[STATE] Partida distribuída %s confirmada para o jogador local %s.", matchID, guestPlayerID)
 
@@ -335,4 +339,12 @@ func (sm *StateManager) IsPlayerOnline(playerID string) bool {
 
 	_, ok := sm.PlayersOnline[playerID]
 	return ok
+}
+
+// SetFailureDetector configura o sistema de detecção de falhas
+func (sm *StateManager) SetFailureDetector(fd interface{ IsServerAlive(serverID string) bool }) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.failureDetector = fd
+	log.Printf("[STATE] Sistema de detecção de falhas configurado")
 }
