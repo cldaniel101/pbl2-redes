@@ -214,7 +214,7 @@ func (s *APIServer) handleConsensusEndpoints(w http.ResponseWriter, r *http.Requ
 		s.handleACK(w, r, matchID)
 	case "check":
 		s.handleCheck(w, r, matchID)
-	case "commit":
+	case "commit", "execute": // Alias: ambos executam a operação após consenso
 		s.handleCommit(w, r, matchID)
 	case "rollback":
 		s.handleRollback(w, r, matchID)
