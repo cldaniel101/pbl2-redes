@@ -109,6 +109,8 @@ func (m *Match) GetOpponentIndex(playerID string) int {
 }
 
 // PlayCard registra uma carta jogada por um jogador
+// Para partidas distribuídas, usa Two-Phase Commit com consenso
+// Para partidas locais, usa lógica simples com lock
 func (m *Match) PlayCard(playerID, cardID string) error {
 	// Valida se o jogador está na partida (sem lock ainda)
 	playerIndex := -1
@@ -139,22 +141,33 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 	}
 	m.mu.Unlock()
 
-	// Verifica se é uma partida distribuída
+	// ========================================
+	// FLUXO: Proposta → ACKs → Verificação → Execução
+	// ========================================
+	// Verifica se é uma partida distribuída (tem relógio vetorial)
 	if m.VectorClock != nil {
 		// Usa Two-Phase Commit para partidas distribuídas
+		// Este fluxo garante consistência entre servidores:
+		// 1. Proposta: Cria operação e propõe para outros servidores
+		// 2. ACKs: Aguarda confirmações com timeout
+		// 3. Verificação: Valida operação em todos os servidores
+		// 4. Execução: Executa se válido, ou faz rollback se inválido
 		return m.playCardWithConsensus(playerID, cardID)
 	}
 
-	// Partida local - usa lógica simples
+	// ========================================
+	// PARTIDA LOCAL - LÓGICA SIMPLES
+	// ========================================
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	// Registra a jogada
 	m.Waiting[playerID] = cardID
+	log.Printf("[MATCH %s] Jogada local registrada: %s jogou %s", m.ID, playerID, cardID)
 
 	// Verifica se ambos jogaram
 	if len(m.Waiting) == 2 {
-		// Resolve a rodada
+		// Resolve a rodada (local, não precisa de consenso)
 		go m.resolveRound()
 	}
 
@@ -162,8 +175,13 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 }
 
 // playCardWithConsensus implementa Two-Phase Commit para jogadas em partidas distribuídas
+// Fluxo: Proposta → ACKs → Verificação → Execução (ou Rollback)
 func (m *Match) playCardWithConsensus(playerID, cardID string) error {
-	// Fase 1: Criar operação e propor
+	// ========================================
+	// FASE 1: PROPOSTA E ACKs
+	// ========================================
+
+	// Cria operação com timestamp vetorial
 	op := m.CreatePlayOperation(playerID, cardID)
 	if op == nil {
 		return fmt.Errorf("falha ao criar operação (partida não distribuída)")
@@ -189,44 +207,69 @@ func (m *Match) playCardWithConsensus(playerID, cardID string) error {
 		otherServers = []string{distMatch.HostServer}
 	}
 
-	log.Printf("[MATCH %s] Iniciando consenso para operação %s com servidores: %v", m.ID, op.ID, otherServers)
+	log.Printf("[MATCH %s] [2PC] Iniciando consenso para operação %s com servidores: %v", m.ID, op.ID, otherServers)
 
-	// Propõe operação (Fase 1)
+	// Propõe operação (Fase 1) - aguarda ACKs com timeout
 	ackChan, errChan := m.proposeOperation(op, otherServers)
 
-	// Aguarda resultado
+	// Aguarda resultado da Fase 1
 	select {
 	case <-ackChan:
-		// Todos os ACKs recebidos, prossegue para Fase 2
-		log.Printf("[MATCH %s] Todos os ACKs recebidos para operação %s", m.ID, op.ID)
+		// ========================================
+		// FASE 2: VERIFICAÇÃO E EXECUÇÃO
+		// ========================================
+		log.Printf("[MATCH %s] [2PC] Todos os ACKs recebidos para operação %s", m.ID, op.ID)
 
-		// Fase 2: Verificação cross-server
+		// Verificação cross-server: valida operação em todos os servidores
 		allValid := true
+		checkTimeout := time.After(time.Duration(ConsensusCheckTimeout) * time.Millisecond)
+
+	CheckLoop:
 		for _, serverAddr := range otherServers {
-			valid, err := s2s.CheckOperation(serverAddr, m.ID, op)
-			if err != nil || !valid {
-				log.Printf("[MATCH %s] Operação %s inválida no servidor %s: %v", m.ID, op.ID, serverAddr, err)
+			select {
+			case <-checkTimeout:
+				log.Printf("[MATCH %s] [2PC] Timeout na verificação cross-server para operação %s", m.ID, op.ID)
 				allValid = false
-				break
+				break CheckLoop
+			default:
+				valid, err := s2s.CheckOperation(serverAddr, m.ID, op)
+				if err != nil || !valid {
+					log.Printf("[MATCH %s] [2PC] Operação %s inválida no servidor %s: %v", m.ID, op.ID, serverAddr, err)
+					allValid = false
+					break CheckLoop
+				}
+				log.Printf("[MATCH %s] [2PC] Operação %s válida no servidor %s", m.ID, op.ID, serverAddr)
 			}
 		}
 
 		if allValid {
 			// Executa localmente
 			if err := m.ExecuteOperation(op); err != nil {
-				log.Printf("[MATCH %s] Erro ao executar operação %s localmente: %v", m.ID, op.ID, err)
+				log.Printf("[MATCH %s] [2PC] Erro ao executar operação %s localmente: %v", m.ID, op.ID, err)
+
+				// Rollback local e remoto
+				m.RollbackOperation(op)
+				for _, serverAddr := range otherServers {
+					go s2s.RollbackOperation(serverAddr, m.ID, op)
+				}
+
 				return err
 			}
 
-			// Solicita commit nos outros servidores
+			// Solicita commit nos outros servidores (assíncrono)
 			for _, serverAddr := range otherServers {
-				go s2s.CommitOperation(serverAddr, m.ID, op)
+				go func(addr string) {
+					if err := s2s.CommitOperation(addr, m.ID, op); err != nil {
+						log.Printf("[MATCH %s] [2PC] Erro ao commitar operação %s em %s: %v", m.ID, op.ID, addr, err)
+					}
+				}(serverAddr)
 			}
 
-			log.Printf("[MATCH %s] Operação %s executada com sucesso via consenso", m.ID, op.ID)
+			log.Printf("[MATCH %s] [2PC] ✓ Operação %s executada com sucesso via consenso", m.ID, op.ID)
 			return nil
 		} else {
-			// Operação inválida, faz rollback
+			// Operação inválida em um ou mais servidores, faz rollback
+			log.Printf("[MATCH %s] [2PC] ✗ Operação %s rejeitada - iniciando rollback", m.ID, op.ID)
 			m.RollbackOperation(op)
 
 			// Solicita rollback nos outros servidores
@@ -238,8 +281,10 @@ func (m *Match) playCardWithConsensus(playerID, cardID string) error {
 		}
 
 	case err := <-errChan:
-		// Timeout ou erro aguardando ACKs
-		log.Printf("[MATCH %s] Erro no consenso para operação %s: %v", m.ID, op.ID, err)
+		// ========================================
+		// ROLLBACK: Timeout ou erro aguardando ACKs
+		// ========================================
+		log.Printf("[MATCH %s] [2PC] ✗ Erro no consenso para operação %s: %v", m.ID, op.ID, err)
 		m.RollbackOperation(op)
 
 		// Solicita rollback nos outros servidores
@@ -252,11 +297,135 @@ func (m *Match) playCardWithConsensus(playerID, cardID string) error {
 }
 
 // resolveRound resolve uma rodada quando ambos jogadores jogaram
+// Para partidas distribuídas, usa consenso para garantir estado consistente
+// Para partidas locais, executa diretamente
 func (m *Match) resolveRound() {
 	m.mu.Lock()
+
+	// Verifica se é uma partida distribuída
+	isDistributed := m.VectorClock != nil
+
+	if isDistributed {
+		// Para partidas distribuídas, usa consenso antes de resolver
+		m.mu.Unlock() // Libera lock antes de consenso
+		m.resolveRoundWithConsensus()
+		return
+	}
+
+	// Partida local - executa diretamente com lock
 	defer m.mu.Unlock()
+	m.executeRoundResolution()
+}
+
+// resolveRoundWithConsensus implementa resolução de rodada com consenso (Two-Phase Commit)
+// Este método garante que todos os servidores concordem com o resultado antes de executar
+func (m *Match) resolveRoundWithConsensus() {
+	// Cria operação de resolução
+	m.mu.Lock()
+	if m.VectorClock == nil {
+		m.mu.Unlock()
+		log.Printf("[MATCH %s] Erro: tentativa de resolver rodada com consenso em partida não distribuída", m.ID)
+		return
+	}
+
+	// Incrementa relógio vetorial
+	m.VectorClock.Tick()
+
+	// Cria operação de resolução
+	op := consensus.NewOperation(
+		consensus.OpTypeResolve,
+		m.ID,
+		m.VectorClock.ToString(),
+		"", // playerID não aplicável para resolução
+		"", // cardID não aplicável para resolução
+		m.VectorClock.GetSnapshot(),
+	)
+	m.OperationQueue.Add(op)
+	m.mu.Unlock()
+
+	// Obtém informações da partida distribuída
+	distMatch, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
+	if !isDistributed {
+		log.Printf("[MATCH %s] Erro: partida não encontrada como distribuída", m.ID)
+		return
+	}
+
+	// Determina outros servidores
+	var otherServers []string
+	isHostServer := m.informer.IsPlayerOnline(distMatch.HostPlayer)
+	if isHostServer {
+		otherServers = []string{distMatch.GuestServer}
+	} else {
+		otherServers = []string{distMatch.HostServer}
+	}
+
+	log.Printf("[MATCH %s] [2PC-RESOLVE] Iniciando consenso de resolução com servidores: %v", m.ID, otherServers)
+
+	// Propõe operação (Fase 1)
+	ackChan, errChan := m.proposeOperation(op, otherServers)
+
+	// Aguarda resultado
+	select {
+	case <-ackChan:
+		// Todos os ACKs recebidos, prossegue para Fase 2
+		log.Printf("[MATCH %s] [2PC-RESOLVE] Todos os ACKs recebidos", m.ID)
+
+		// Verificação cross-server
+		allValid := true
+		for _, serverAddr := range otherServers {
+			valid, err := s2s.CheckOperation(serverAddr, m.ID, op)
+			if err != nil || !valid {
+				log.Printf("[MATCH %s] [2PC-RESOLVE] Operação inválida no servidor %s: %v", m.ID, serverAddr, err)
+				allValid = false
+				break
+			}
+		}
+
+		if allValid {
+			// Executa resolução localmente
+			m.mu.Lock()
+			m.executeRoundResolution()
+			m.mu.Unlock()
+
+			// Solicita commit nos outros servidores
+			for _, serverAddr := range otherServers {
+				go func(addr string) {
+					if err := s2s.CommitOperation(addr, m.ID, op); err != nil {
+						log.Printf("[MATCH %s] [2PC-RESOLVE] Erro ao commitar em %s: %v", m.ID, addr, err)
+					}
+				}(serverAddr)
+			}
+
+			log.Printf("[MATCH %s] [2PC-RESOLVE] ✓ Resolução executada com sucesso via consenso", m.ID)
+		} else {
+			// Rollback
+			log.Printf("[MATCH %s] [2PC-RESOLVE] ✗ Resolução rejeitada - rollback", m.ID)
+			m.RollbackOperation(op)
+			for _, serverAddr := range otherServers {
+				go s2s.RollbackOperation(serverAddr, m.ID, op)
+			}
+		}
+
+	case err := <-errChan:
+		// Timeout ou erro
+		log.Printf("[MATCH %s] [2PC-RESOLVE] ✗ Erro no consenso: %v", m.ID, err)
+		m.RollbackOperation(op)
+		for _, serverAddr := range otherServers {
+			go s2s.RollbackOperation(serverAddr, m.ID, op)
+		}
+	}
+}
+
+// executeRoundResolution executa a lógica de resolução de rodada
+// Este método DEVE ser chamado apenas com lock já adquirido
+// e apenas após consenso para partidas distribuídas
+func (m *Match) executeRoundResolution() {
+	// ========================================
+	// FASE 1: PROCESSAMENTO (SEM BROADCASTS)
+	// ========================================
 
 	m.State = StateResolving
+	log.Printf("[MATCH %s] Resolvendo rodada %d", m.ID, m.Round)
 
 	// Pega as cartas jogadas
 	p1CardID := m.Waiting[m.P1.ID]
@@ -292,12 +461,20 @@ func (m *Match) resolveRound() {
 	// Cria logs da rodada
 	logs := m.createRoundLogs(p1Card, p2Card, p1Bonus, p1DamageDealt, p2DamageDealt)
 
-	// Envia resultado da rodada
-	m.broadcastRoundResult(p1Card, p2Card, p1Bonus, p2Bonus, p1DamageDealt, p2DamageDealt, logs)
-
 	// Limpa as jogadas
 	m.Waiting = make(map[string]string)
 	m.Round++
+
+	log.Printf("[MATCH %s] Estado após resolução - P1 HP: %d, P2 HP: %d", m.ID, m.HP[0], m.HP[1])
+
+	// ========================================
+	// FASE 2: BROADCASTS APÓS ESTADO CONSISTENTE
+	// ========================================
+	// Apenas após todo o processamento e com estado consistente,
+	// fazemos os broadcasts. Isso evita deadlocks e race conditions.
+
+	// Envia resultado da rodada
+	m.broadcastRoundResult(p1Card, p2Card, p1Bonus, p2Bonus, p1DamageDealt, p2DamageDealt, logs)
 
 	// Verifica fim do jogo
 	if m.EndIfGameOver() {
@@ -308,7 +485,7 @@ func (m *Match) resolveRound() {
 	m.State = StateAwaitingPlays
 	m.Deadline = time.Now().Add(time.Duration(RoundPlayTimeout) * time.Millisecond)
 
-	// Envia estado atualizado
+	// Envia estado atualizado (após estado estar completamente consistente)
 	m.BroadcastState()
 
 	// Agenda timeout para auto-play apenas se pelo menos um jogador tiver autoplay ativo
@@ -574,41 +751,6 @@ func (m *Match) sendToPlayerSmart(playerID string, msg protocol.ServerMsg) {
 	}
 }
 
-// forwardPlayIfNeeded foi substituído pelo sistema de consenso Two-Phase Commit
-// O método playCardWithConsensus() agora gerencia a sincronização entre servidores
-// DEPRECADO: Este método não é mais usado
-/*
-func (m *Match) forwardPlayIfNeeded(playerID, cardID string) {
-	// Obter informações da partida distribuída
-	distMatch, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
-	if !isDistributed {
-		return // Não faz nada em partidas locais
-	}
-
-	// Verifica se o jogador que fez a jogada está neste servidor.
-	// Apenas retransmitimos jogadas de jogadores locais.
-	isPlayerLocal := m.informer.IsPlayerOnline(playerID)
-	if !isPlayerLocal {
-		log.Printf("[MATCH %s] Não retransmitindo jogada de %s pois não é local", m.ID, playerID)
-		return
-	}
-
-	// Determina o servidor do oponente usando o nome de serviço correto
-	var opponentServer string
-	if distMatch.HostPlayer == playerID {
-		opponentServer = distMatch.GuestServer
-		fmt.Println("\n\n\n" + opponentServer + "\n\n\n")
-	} else {
-		opponentServer = distMatch.HostServer
-	}
-
-	log.Printf("[MATCH %s] Retransmitindo jogada do jogador local %s (carta %s) para o servidor do oponente em %s",
-		m.ID, playerID, cardID, opponentServer)
-
-	s2s.ForwardAction(opponentServer, m.ID, playerID, cardID)
-}
-*/
-
 // scheduleAutoPlay agenda o auto-play se necessário
 func (m *Match) scheduleAutoPlay() {
 	time.Sleep(time.Duration(RoundPlayTimeout) * time.Millisecond)
@@ -820,18 +962,23 @@ func (m *Match) proposeOperation(op *consensus.Operation, otherServers []string)
 		// Registra operação como pendente de ACKs
 		m.AddPendingACK(op.ID, otherServers)
 
-		log.Printf("[MATCH %s] Propondo operação %s para %v", m.ID, op.ID, otherServers)
+		log.Printf("[MATCH %s] [2PC] Propondo operação %s para %v", m.ID, op.ID, otherServers)
 
-		// Envia proposta para outros servidores
+		// Envia proposta para outros servidores (paralelo)
 		for _, serverAddr := range otherServers {
-			go s2s.ProposeOperation(serverAddr, m.ID, op)
+			go func(addr string) {
+				if err := s2s.ProposeOperation(addr, m.ID, op); err != nil {
+					log.Printf("[MATCH %s] [2PC] Erro ao propor para %s: %v", m.ID, addr, err)
+				}
+			}(serverAddr)
 		}
 
-		// Aguarda ACKs com timeout
-		allACKsReceived := m.waitForACKs(op.ID, 5*time.Second)
+		// Aguarda ACKs com timeout configurável
+		timeout := time.Duration(ConsensusACKTimeout) * time.Millisecond
+		allACKsReceived := m.waitForACKs(op.ID, timeout)
 
 		if !allACKsReceived {
-			errChan <- fmt.Errorf("timeout aguardando ACKs para operação %s", op.ID)
+			errChan <- fmt.Errorf("timeout aguardando ACKs para operação %s (timeout: %dms)", op.ID, ConsensusACKTimeout)
 			return
 		}
 
@@ -844,10 +991,10 @@ func (m *Match) proposeOperation(op *consensus.Operation, otherServers []string)
 // waitForACKs aguarda confirmações de todos os servidores
 // Retorna true se todos confirmaram, false se timeout
 func (m *Match) waitForACKs(operationID string, timeout time.Duration) bool {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(time.Duration(ConsensusPollInterval) * time.Millisecond)
 	defer ticker.Stop()
 
-	deadline := time.Now().Add(timeout)
+	timeoutChan := time.After(timeout)
 
 	for {
 		select {
@@ -858,6 +1005,7 @@ func (m *Match) waitForACKs(operationID string, timeout time.Duration) bool {
 
 			if !exists {
 				// Todos os ACKs foram recebidos (MarkACK já removeu)
+				log.Printf("[MATCH %s] Todos os ACKs recebidos para operação %s", m.ID, operationID)
 				return true
 			}
 
@@ -871,14 +1019,25 @@ func (m *Match) waitForACKs(operationID string, timeout time.Duration) bool {
 			}
 
 			if allReceived {
+				log.Printf("[MATCH %s] Todos os ACKs recebidos para operação %s", m.ID, operationID)
 				return true
 			}
 
-			// Verifica timeout
-			if time.Now().After(deadline) {
-				log.Printf("[MATCH %s] Timeout aguardando ACKs para operação %s", m.ID, operationID)
-				return false
+		case <-timeoutChan:
+			// Timeout atingido
+			m.ackMu.RLock()
+			acks := m.PendingACKs[operationID]
+			var pendingServers []string
+			for serverID, acked := range acks {
+				if !acked {
+					pendingServers = append(pendingServers, serverID)
+				}
 			}
+			m.ackMu.RUnlock()
+
+			log.Printf("[MATCH %s] ⏱️ Timeout aguardando ACKs para operação %s (pendentes: %v)",
+				m.ID, operationID, pendingServers)
+			return false
 		}
 	}
 }

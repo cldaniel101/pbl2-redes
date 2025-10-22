@@ -33,6 +33,16 @@ const (
 	ReconnectWindow   = 10_000 // ms para reconexão rápida
 )
 
+// Constantes do sistema de consenso (Two-Phase Commit)
+const (
+	ConsensusACKTimeout      = 5_000  // ms - timeout para receber ACKs de todos os servidores
+	ConsensusCheckTimeout    = 3_000  // ms - timeout para verificação cross-server
+	ConsensusCommitTimeout   = 5_000  // ms - timeout para commit em outros servidores
+	ConsensusPollInterval    = 100    // ms - intervalo de verificação de ACKs
+	ConsensusMaxRetries      = 3      // número máximo de tentativas de operação
+	ConsensusOperationExpiry = 30_000 // ms - tempo até operação pendente expirar
+)
+
 // PlayerStatus representa o estado de um jogador
 type PlayerStatus string
 
