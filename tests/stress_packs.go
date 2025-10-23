@@ -86,9 +86,6 @@ func main() {
 
 	// Coleta resultados
 	var successes, failures int
-	var allCards []string
-	var successfulPlayers []string
-	var failedPlayers []string
 	var allResults []TestResult
 
 	fmt.Println("=== RESULTADOS ===")
@@ -96,12 +93,9 @@ func main() {
 		allResults = append(allResults, result)
 		if result.Success {
 			successes++
-			successfulPlayers = append(successfulPlayers, result.PlayerID)
-			allCards = append(allCards, result.Cards...)
 			fmt.Printf("✅ %s: %v\n", result.PlayerID, result.Cards)
 		} else {
 			failures++
-			failedPlayers = append(failedPlayers, result.PlayerID)
 			fmt.Printf("❌ %s: %v\n", result.PlayerID, result.Error)
 		}
 	}

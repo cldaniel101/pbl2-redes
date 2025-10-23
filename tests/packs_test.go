@@ -61,12 +61,10 @@ func TestPackStoreConcurrency(t *testing.T) {
 
 	// Analisa resultados
 	var successes, failures int
-	var allCards []string
 
 	for res := range results {
 		if res.err == nil {
 			successes++
-			allCards = append(allCards, res.cards...)
 
 			// Verifica se o pacote tem o tamanho correto
 			if len(res.cards) != cardsPerPack {
