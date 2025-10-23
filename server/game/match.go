@@ -461,17 +461,7 @@ func (m *Match) sendToPlayerSmart(playerID string, msg protocol.ServerMsg) {
 
 	if isPlayerLocal {
 		m.sendToPlayer(playerID, msg)
-	} else {
-		// O jogador é remoto, determina para qual servidor retransmitir.
-		var remoteServer string
-		if isTargetHost {
-			remoteServer = distMatch.HostServer
-		} else {
-			remoteServer = distMatch.GuestServer
-		}
-		log.Printf("[MATCH %s] A retransmitir mensagem do tipo %s para o jogador remoto %s no servidor %s", m.ID, msg.T, playerID, remoteServer)
-		s2s.ForwardMessage(remoteServer, playerID, msg)
-	}
+	} 
 }
 
 // forwardPlayIfNeeded verifica se uma jogada precisa ser retransmitida para um oponente

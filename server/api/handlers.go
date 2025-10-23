@@ -101,6 +101,15 @@ func (s *APIServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
 		OpponentID: req.HostPlayerID,
 	})
 
+	// --- INÍCIO DA CORREÇÃO ---
+	// Envia o estado inicial (Rodada 1) para o jogador convidado (local).
+	// Isto é crucial para que ele receba a sua mão inicial.
+	// (Usamos FindMatchByID porque ConfirmAndCreateDistributedMatch já o criou)
+	if match := s.stateManager.FindMatchByID(req.MatchID); match != nil {
+		match.BroadcastState()
+	}
+	// --- FIM DA CORREÇÃO ---
+
 	w.WriteHeader(http.StatusOK)
 }
 
