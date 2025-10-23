@@ -76,7 +76,9 @@ func (s *TCPServer) writeLoop(player *protocol.PlayerConn, sub pubsub.Subscriber
 
 	for msg := range sub {
 		if serverMsg, ok := msg.Payload.(protocol.ServerMsg); ok {
-			if err := player.SendMsg(serverMsg); err != nil {
+			fmt.Printf("\n\n\n%+v\n\n\n", serverMsg)
+			err := player.SendMsg(serverMsg)
+			if err != nil {
 				log.Printf("[CLIENT_MGR] Erro fatal ao escrever para o cliente %s: %v. A encerrar o write loop.", player.ID, err)
 				return
 			}

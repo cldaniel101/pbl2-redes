@@ -126,12 +126,13 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 		return fmt.Errorf("carta inválida")
 	}
 
+	
+	// Registra a jogada e remove a carta da mão
+	m.Waiting[playerID] = cardID
+
 	// Se a partida for distribuída, retransmite a jogada para o outro servidor
 	// ANTES de registrar a jogada localmente.
 	m.forwardPlayIfNeeded(playerID, cardID)
-
-	// Registra a jogada e remove a carta da mão
-	m.Waiting[playerID] = cardID
 
 	// Verifica se ambos jogaram
 	if len(m.Waiting) == 2 {
@@ -188,6 +189,7 @@ func (m *Match) resolveRound() {
 
 	// Limpa as jogadas
 	m.Waiting = make(map[string]string)
+	fmt.Println("\n\n\n\n" + fmt.Sprintf("%v", m.Waiting) + "\n\n\n\n")
 	m.Round++
 
 	// Verifica fim do jogo
@@ -199,8 +201,10 @@ func (m *Match) resolveRound() {
 	m.State = StateAwaitingPlays
 	m.Deadline = time.Now().Add(time.Duration(RoundPlayTimeout) * time.Millisecond)
 
+	m.DebugPrintNewRoundState()
+
 	// Envia estado atualizado
-	m.BroadcastState()
+	m.broadcastState_nolock()
 
 	// Agenda timeout para auto-play apenas se pelo menos um jogador tiver autoplay ativo
 	if m.P1.AutoPlay || m.P2.AutoPlay {
@@ -329,10 +333,15 @@ func (m *Match) broadcastRoundResult(p1Card, p2Card Card, p1Bonus, p2Bonus, p1Dm
 }
 
 // BroadcastState envia o estado atual para ambos jogadores
-// BroadcastState envia o estado atual para ambos jogadores
 func (m *Match) BroadcastState() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.broadcastState_nolock()
+}
+
+func (m *Match) broadcastState_nolock() {
+	//m.mu.Lock()
+	//defer m.mu.Unlock()
 
 	// Calcula deadline apenas se pelo menos um jogador tiver autoplay ativo
 	var deadlineMs int64 = 0
@@ -485,8 +494,7 @@ func (m *Match) forwardPlayIfNeeded(playerID, cardID string) {
 	// Determina o servidor do oponente usando o nome de serviço correto
 	var opponentServer string
 	if distMatch.HostPlayer == playerID {
-		opponentServer = distMatch.GuestServer
-		fmt.Println("\n\n\n" + opponentServer + "\n\n\n")
+		opponentServer = distMatch.GuestServer		
 	} else {
 		opponentServer = distMatch.HostServer
 	}
@@ -563,4 +571,45 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+
+func (m *Match) DebugPrintNewRoundState() {
+	// (Esta função deve ser chamada de dentro de um método que já
+	// tenha o 'm.mu.Lock()', como a função 'resolveRound')
+
+	log.Printf("\n\n=============================================\n")
+	log.Printf("  INICIANDO NOVA RODADA (Partida %s)\n", m.ID)
+	log.Printf("=============================================\n\n")
+
+	// 1. Variável m.Round (Contador de Rodada)
+	//
+	log.Printf("  m.Round: %d\n\n", m.Round)
+
+	// 2. Variável m.State (Estado da Partida)
+	//
+	log.Printf("  m.State: %s\n\n", m.State)
+
+	// 3. Variável m.HP (Pontos de Vida)
+	//
+	log.Printf("  m.HP (Pontos de Vida):\n")
+	log.Printf("    -> P1 (%s) HP: %d\n", m.P1.ID, m.HP[0])
+	log.Printf("    -> P2 (%s) HP: %d\n\n", m.P2.ID, m.HP[1])
+
+	// 4. Variável m.Hands (Mãos dos Jogadores)
+	//
+	log.Printf("  m.Hands (Mãos Repostas):\n")
+	log.Printf("    -> P1 (%s) Mão: %v\n", m.P1.ID, m.Hands[0])
+	log.Printf("    -> P2 (%s) Mão: %v\n\n", m.P2.ID, m.Hands[1])
+
+	// 5. Variável m.Waiting (Jogadas em Espera)
+	//
+	if len(m.Waiting) == 0 {
+		log.Printf("  m.Waiting: (mapa vazio - pronto para novas jogadas)\n\n")
+	} else {
+		// Isso não deveria acontecer se a lógica estiver correta
+		log.Printf("  [ALERTA] m.Waiting NÃO está vazio: %v\n\n", m.Waiting)
+	}
+
+	log.Printf("=============================================\n\n")
 }
