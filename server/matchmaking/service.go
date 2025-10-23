@@ -21,14 +21,18 @@ type MatchmakingService struct {
 	stateManager      *state.StateManager
 	broker            *pubsub.Broker
 	httpClient        *http.Client
-	serverAddress     string                     // Endereço deste servidor (ex: http://server-1:8000)
-	allServers        []string                   // Lista de todos os servidores no cluster
-	nextServerAddress string                     // O próximo servidor no anel
-	tokenAcquiredChan <-chan protocol.TokenState // Canal para receber a notificação do token
+	serverAddress     string                   // Endereço deste servidor (ex: http://server-1:8000)
+	allServers        []string                 // Lista de todos os servidores no cluster
+	nextServerAddress string                   // O próximo servidor no anel
+	tokenChan         chan protocol.TokenState // Canal para receber e (no líder) reinjetar o token
+	isLeader          bool                     // Flag para indicar se este nó é o líder
 }
 
 // NewService cria uma nova instância do serviço de matchmaking.
-func NewService(sm *state.StateManager, broker *pubsub.Broker, tokenChan <-chan protocol.TokenState, selfAddr string, allAddrs []string, nextAddr string) *MatchmakingService {
+func NewService(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan protocol.TokenState, selfAddr string, allAddrs []string, nextAddr string) *MatchmakingService {
+	isLeader := selfAddr == allAddrs[0]
+	log.Printf("[MATCHMAKING] Configurado como líder: %t", isLeader)
+
 	return &MatchmakingService{
 		stateManager:      sm,
 		broker:            broker,
@@ -36,23 +40,71 @@ func NewService(sm *state.StateManager, broker *pubsub.Broker, tokenChan <-chan 
 		serverAddress:     selfAddr,
 		allServers:        allAddrs,
 		nextServerAddress: nextAddr,
-		tokenAcquiredChan: tokenChan,
+		tokenChan:         tokenChan,
+		isLeader:          isLeader,
 	}
 }
 
 // Run inicia o loop principal do serviço de matchmaking, que aguarda pelo token para agir.
 func (s *MatchmakingService) Run() {
-	log.Println("[MATCHMAKING] Serviço iniciado. A aguardar pelo token...")
-	for {
-		tokenState := <-s.tokenAcquiredChan
+	if !s.isLeader {
+		s.runFollower()
+		return
+	}
+	s.runLeader()
+}
+
+// runFollower é o loop para servidores que não são líderes. Apenas aguardam e processam o token.
+func (s *MatchmakingService) runFollower() {
+	log.Println("[MATCHMAKING] Serviço (Seguidor) iniciado. A aguardar pelo token...")
+	for tokenState := range s.tokenChan {
 		log.Printf("[MATCHMAKING] Token recebido. Estado: %+v. A verificar a fila...", tokenState)
-
-		// Processa a fila de pacotes ANTES de qualquer outra coisa.
-		tokenState = s.processPackRequests(tokenState)
-
+		updatedTokenState := s.processPackRequests(tokenState)
 		s.processMatchmakingQueue()
-		time.Sleep(2 * time.Second)
-		s.passTokenToNextServer(tokenState)
+		time.Sleep(2 * time.Second) // Simula trabalho
+		s.passTokenToNextServer(updatedTokenState)
+	}
+	log.Println("[MATCHMAKING] Canal do token fechado. Encerrando (Seguidor).")
+}
+
+// runLeader é o loop para o servidor líder, que inclui o watchdog para regenerar o token.
+func (s *MatchmakingService) runLeader() {
+	log.Println("[MATCHMAKING] Serviço (Líder) iniciado com watchdog de token.")
+	// Timeout generoso: 4 segundos por servidor no anel.
+	watchdogTimeout := time.Duration(len(s.allServers)*4) * time.Second
+	timer := time.NewTimer(watchdogTimeout)
+
+	for {
+		select {
+		case tokenState, ok := <-s.tokenChan:
+			if !ok {
+				log.Println("[MATCHMAKING] [LEADER] Canal do token fechado. Encerrando.")
+				return
+			}
+
+			log.Printf("[MATCHMAKING] [LEADER] Token recebido. Watchdog resetado.")
+			if !timer.Stop() {
+				// Esvazia o canal do timer se Stop() retornar false, o que é necessário
+				// se o timer já tiver disparado e o evento estiver pendente.
+				<-timer.C
+			}
+			timer.Reset(watchdogTimeout)
+
+			// Processa e passa o token
+			updatedTokenState := s.processPackRequests(tokenState)
+			s.processMatchmakingQueue()
+			time.Sleep(2 * time.Second) // Simula trabalho
+			s.passTokenToNextServer(updatedTokenState)
+
+		case <-timer.C:
+			log.Println("[MATCHMAKING] [LEADER] Watchdog timeout: Token perdido! A regenerar...")
+			// Regenera o token e injeta-o no seu próprio canal para iniciar o processamento.
+			// A outra case do select irá capturá-lo imediatamente.
+			initialStock := 1000 // Estratégia simples de recuperação
+			log.Printf("[MATCHMAKING] [LEADER] A injetar novo estado no token: %d pacotes", initialStock)
+			s.tokenChan <- protocol.TokenState{PackStock: initialStock}
+			// O timer será resetado na case de recepção do token.
+		}
 	}
 }
 
@@ -115,12 +167,15 @@ func (s *MatchmakingService) findAndCreateDistributedMatch(localPlayer *protocol
 			continue
 		}
 
+		// Primeira chamada S2S: encontrar um oponente
 		resp, err := s.httpClient.Get(serverAddr + "/api/find-opponent")
-		if err != nil || resp.StatusCode != http.StatusOK {
-			if resp != nil {
-				_ = resp.Body.Close()
-			}
-			continue
+		if err != nil {
+			log.Printf("[MATCHMAKING] Erro ao contactar %s para encontrar oponente: %v", serverAddr, err)
+			continue // Tenta o próximo servidor
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			continue // Nenhum jogador encontrado, tenta o próximo servidor
 		}
 
 		var opponentInfo struct {
@@ -140,13 +195,22 @@ func (s *MatchmakingService) findAndCreateDistributedMatch(localPlayer *protocol
 			"guestPlayerId": opponentInfo.PlayerID,
 		})
 
+		// Segunda chamada S2S: solicitar a partida
 		resp, err = s.httpClient.Post(serverAddr+"/api/request-match", "application/json", bytes.NewBuffer(requestBody))
 		if err != nil || resp.StatusCode != http.StatusOK {
 			if resp != nil {
 				_ = resp.Body.Close()
 			}
-			log.Printf("[MATCHMAKING] Falha ao solicitar partida com %s.", serverAddr)
-			return false
+			log.Printf("[MATCHMAKING] Falha S2S ao solicitar partida com %s. Notificando jogador.", serverAddr)
+
+			// Remove o jogador da fila e notifica-o do erro.
+			s.stateManager.RemovePlayersFromQueue(localPlayer)
+			s.broker.Publish("player."+localPlayer.ID, protocol.ServerMsg{
+				T:    protocol.ERROR,
+				Code: "MATCH_SETUP_FAILED",
+				Msg:  "Não foi possível criar a partida com o oponente. Por favor, tente procurar novamente.",
+			})
+			return true // Retorna true para parar de procurar outros oponentes.
 		}
 		_ = resp.Body.Close()
 

@@ -98,9 +98,10 @@ const (
 
 // Resultados de partida
 const (
-	WIN  = "WIN"
-	LOSE = "LOSE"
-	DRAW = "DRAW"
+	WIN                   = "WIN"
+	LOSE                  = "LOSE"
+	DRAW                  = "DRAW"
+	VICTORY_BY_DISCONNECT = "VICTORY_BY_DISCONNECT"
 )
 
 // PlayerConn representa um jogador conectado com encoder/decoder JSON
