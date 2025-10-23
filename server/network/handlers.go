@@ -69,7 +69,7 @@ func (s *TCPServer) sendToPlayer(playerID string, msg protocol.ServerMsg) {
 func (s *TCPServer) handleMessage(player *protocol.PlayerConn, msg *protocol.ClientMsg) {
 	switch msg.T {
 	case protocol.FIND_MATCH:
-		s.handleFindMatch(player) // jogador entrou na fila para encontrar uma partida 
+		s.handleFindMatch(player) // jogador entrou na fila para encontrar uma partida
 	case protocol.PLAY:
 		s.handlePlay(player, msg.CardID) // O jogador jogou uma carta numa partida
 	case protocol.CHAT:
@@ -97,7 +97,7 @@ func (s *TCPServer) handleFindMatch(player *protocol.PlayerConn) {
 	s.stateManager.AddPlayerToQueue(player)
 	s.sendToPlayer(player.ID, protocol.ServerMsg{
 		T:    protocol.ERROR,
-		Code: "QUEUED",	
+		Code: "QUEUED",
 		Msg:  "Você entrou na fila de matchmaking.",
 	})
 }
@@ -147,21 +147,44 @@ func (s *TCPServer) handlePing(player *protocol.PlayerConn, ts int64) {
 }
 
 func (s *TCPServer) handleOpenPack(player *protocol.PlayerConn) {
-	cards, err := s.stateManager.PackSystem.OpenPack(player.ID)
-	if err != nil {
+	// 1. Criar um canal para receber o resultado de forma assíncrona.
+	replyChan := make(chan state.PackResult, 1)
+
+	// 2. Criar e enfileirar o pedido.
+	request := &state.PackRequest{
+		PlayerID:  player.ID,
+		ReplyChan: replyChan,
+	}
+	s.stateManager.EnqueuePackRequest(request)
+
+	// 3. Aguardar pelo resultado com um timeout.
+	select {
+	case result := <-replyChan:
+		// O resultado chegou do processador do token.
+		if result.Err != nil {
+			s.sendToPlayer(player.ID, protocol.ServerMsg{
+				T:    protocol.ERROR,
+				Code: protocol.OUT_OF_STOCK, // Ou outro código de erro relevante
+				Msg:  result.Err.Error(),
+			})
+		} else {
+			s.sendToPlayer(player.ID, protocol.ServerMsg{
+				T:     protocol.PACK_OPENED,
+				Cards: result.Cards,
+				// O stock atualizado virá no processamento do token.
+				// Podemos omiti-lo aqui ou obter do resultado se o incluirmos.
+			})
+			log.Printf("[HANDLER] %s abriu um pacote (processado via token): %v", player.ID, result.Cards)
+		}
+	case <-time.After(10 * time.Second):
+		// Timeout - o token pode estar demorando muito ou perdido.
 		s.sendToPlayer(player.ID, protocol.ServerMsg{
 			T:    protocol.ERROR,
-			Code: protocol.OUT_OF_STOCK,
-			Msg:  err.Error(),
+			Code: "REQUEST_TIMEOUT",
+			Msg:  "O pedido para abrir o pacote demorou demasiado a ser processado.",
 		})
-		return
+		log.Printf("[HANDLER] Timeout ao aguardar resultado do pacote para %s", player.ID)
 	}
-	s.sendToPlayer(player.ID, protocol.ServerMsg{
-		T:     protocol.PACK_OPENED,
-		Cards: cards,
-		Stock: s.stateManager.PackSystem.GetStock(),
-	})
-	log.Printf("[HANDLER] %s abriu um pacote: %v", player.ID, cards)
 }
 
 func (s *TCPServer) handleAutoPlay(player *protocol.PlayerConn, enable bool) {

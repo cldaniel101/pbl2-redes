@@ -17,11 +17,11 @@ type APIServer struct {
 	serverAddr   string
 	// O canal de token é injetado para que o handler possa notificar
 	// o serviço de matchmaking quando o token for recebido.
-	tokenAcquiredChan chan<- bool
+	tokenAcquiredChan chan<- protocol.TokenState
 }
 
 // NewServer cria uma nova instância do servidor da API.
-func NewServer(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan<- bool, serverAddr string) *APIServer {
+func NewServer(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan<- protocol.TokenState, serverAddr string) *APIServer {
 	return &APIServer{
 		stateManager:      sm,
 		broker:            broker,
@@ -115,12 +115,26 @@ func (s *APIServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
 
 // handleReceiveToken recebe o token de outro servidor e notifica o serviço de matchmaking.
 func (s *APIServer) handleReceiveToken(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[API] Recebi o token do servidor anterior.")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var tokenState protocol.TokenState
+	if err := json.NewDecoder(r.Body).Decode(&tokenState); err != nil {
+		log.Printf("[API] Erro ao decodificar o estado do token: %v", err)
+		http.Error(w, "Corpo do pedido inválido", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[API] Recebi o token do servidor anterior com estado: %+v", tokenState)
+
 	select {
-	case s.tokenAcquiredChan <- true:
+	case s.tokenAcquiredChan <- tokenState:
 		// Notifica o matchmaking que pode começar a sua verificação.
 	default:
 		// Evita bloquear se o serviço de matchmaking não estiver pronto para receber.
+		log.Println("[API] Aviso: canal do token bloqueado, não foi possível enviar o estado.")
 	}
 	w.WriteHeader(http.StatusOK)
 }
@@ -168,28 +182,28 @@ func (s *APIServer) handleMatchAction(w http.ResponseWriter, r *http.Request) {
 
 // handleForwardMessage recebe uma mensagem de estado do servidor anfitrião e a envia para o jogador local.
 func (s *APIServer) handleForwardMessage(w http.ResponseWriter, r *http.Request) {
-    var msg protocol.ServerMsg
-    if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
-        http.Error(w, "JSON inválido", http.StatusBadRequest)
-        return
-    }
+	var msg protocol.ServerMsg
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+		http.Error(w, "JSON inválido", http.StatusBadRequest)
+		return
+	}
 
-    // O servidor que retransmite adiciona o ID do jogador alvo num cabeçalho.
-    playerID := r.Header.Get("X-Player-ID")
-    if playerID == "" {
-        log.Printf("[API] Não foi possível retransmitir a mensagem, ID do jogador em falta no cabeçalho X-Player-ID.")
-        http.Error(w, "ID do jogador em falta", http.StatusBadRequest)
-        return
-    }
+	// O servidor que retransmite adiciona o ID do jogador alvo num cabeçalho.
+	playerID := r.Header.Get("X-Player-ID")
+	if playerID == "" {
+		log.Printf("[API] Não foi possível retransmitir a mensagem, ID do jogador em falta no cabeçalho X-Player-ID.")
+		http.Error(w, "ID do jogador em falta", http.StatusBadRequest)
+		return
+	}
 
-    // Apenas encaminha a mensagem se o jogador estiver realmente online neste servidor.
-    // Isso evita que um servidor processe mensagens para jogadores que não são seus.
-    if s.stateManager.IsPlayerOnline(playerID) {
-        log.Printf("[API] Retransmitindo mensagem do tipo %s para o jogador %s", msg.T, playerID)
-        s.sendToPlayer(playerID, msg)
-    } else {
-        log.Printf("[API] Mensagem para %s ignorada, jogador não está online neste servidor.", playerID)
-    }
+	// Apenas encaminha a mensagem se o jogador estiver realmente online neste servidor.
+	// Isso evita que um servidor processe mensagens para jogadores que não são seus.
+	if s.stateManager.IsPlayerOnline(playerID) {
+		log.Printf("[API] Retransmitindo mensagem do tipo %s para o jogador %s", msg.T, playerID)
+		s.sendToPlayer(playerID, msg)
+	} else {
+		log.Printf("[API] Mensagem para %s ignorada, jogador não está online neste servidor.", playerID)
+	}
 
-    w.WriteHeader(http.StatusOK)
+	w.WriteHeader(http.StatusOK)
 }

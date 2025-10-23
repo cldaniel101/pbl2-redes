@@ -11,6 +11,7 @@ import (
 	"pingpong/server/api"
 	"pingpong/server/matchmaking"
 	"pingpong/server/network"
+	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
 	"pingpong/server/state"
 )
@@ -43,12 +44,12 @@ func main() {
 	// 2. Inicialização dos Componentes Centrais
 	stateManager := state.NewStateManager()
 	broker := pubsub.NewBroker()
-	
+
 	// Canal para o APIServer notificar o MatchmakingService quando o token chegar.
-	tokenAcquiredChan := make(chan bool, 1)
+	tokenAcquiredChan := make(chan protocol.TokenState, 1)
 
 	// 3. Injeção de Dependências e Inicialização dos Serviços
-	
+
 	// Serviço de Matchmaking (executado em segundo plano)
 	matchmakingService := matchmaking.NewService(
 		stateManager,
@@ -93,7 +94,9 @@ func main() {
 		log.Println("[MAIN] Eu sou o nó inicial. A criar e a passar o token pela primeira vez após 5 segundos...")
 		go func() {
 			time.Sleep(5 * time.Second) // Espera um pouco para os outros servidores estarem online
-			tokenAcquiredChan <- true
+			initialStock := 1000        // Estoque inicial de pacotes
+			log.Printf("[MAIN] A injetar estado inicial no token: %d pacotes", initialStock)
+			tokenAcquiredChan <- protocol.TokenState{PackStock: initialStock}
 		}()
 	}
 

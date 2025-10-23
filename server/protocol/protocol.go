@@ -54,6 +54,11 @@ type PlayerView struct {
 	DmgTaken     int      `json:"dmgTaken,omitempty"`
 }
 
+// TokenState representa o estado global que é passado junto com o token.
+type TokenState struct {
+	PackStock int `json:"packStock"`
+}
+
 // Constantes de tipos de mensagens
 const (
 	// Cliente -> Servidor

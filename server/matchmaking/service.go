@@ -3,12 +3,13 @@ package matchmaking
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"time"
 
-	"pingpong/server/game" 
+	"pingpong/server/game"
 	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
 	"pingpong/server/state"
@@ -20,14 +21,14 @@ type MatchmakingService struct {
 	stateManager      *state.StateManager
 	broker            *pubsub.Broker
 	httpClient        *http.Client
-	serverAddress     string   // Endereço deste servidor (ex: http://server-1:8000)
-	allServers        []string // Lista de todos os servidores no cluster
-	nextServerAddress string   // O próximo servidor no anel
-	tokenAcquiredChan <-chan bool // Canal para receber a notificação do token
+	serverAddress     string                     // Endereço deste servidor (ex: http://server-1:8000)
+	allServers        []string                   // Lista de todos os servidores no cluster
+	nextServerAddress string                     // O próximo servidor no anel
+	tokenAcquiredChan <-chan protocol.TokenState // Canal para receber a notificação do token
 }
 
 // NewService cria uma nova instância do serviço de matchmaking.
-func NewService(sm *state.StateManager, broker *pubsub.Broker, tokenChan <-chan bool, selfAddr string, allAddrs []string, nextAddr string) *MatchmakingService {
+func NewService(sm *state.StateManager, broker *pubsub.Broker, tokenChan <-chan protocol.TokenState, selfAddr string, allAddrs []string, nextAddr string) *MatchmakingService {
 	return &MatchmakingService{
 		stateManager:      sm,
 		broker:            broker,
@@ -43,12 +44,46 @@ func NewService(sm *state.StateManager, broker *pubsub.Broker, tokenChan <-chan 
 func (s *MatchmakingService) Run() {
 	log.Println("[MATCHMAKING] Serviço iniciado. A aguardar pelo token...")
 	for {
-		<-s.tokenAcquiredChan
-		log.Println("[MATCHMAKING] Token recebido. A verificar a fila...")
+		tokenState := <-s.tokenAcquiredChan
+		log.Printf("[MATCHMAKING] Token recebido. Estado: %+v. A verificar a fila...", tokenState)
+
+		// Processa a fila de pacotes ANTES de qualquer outra coisa.
+		tokenState = s.processPackRequests(tokenState)
+
 		s.processMatchmakingQueue()
 		time.Sleep(2 * time.Second)
-		s.passTokenToNextServer()
+		s.passTokenToNextServer(tokenState)
 	}
+}
+
+// processPackRequests processa a fila de pedidos de pacotes.
+// Retorna o estado do token atualizado.
+func (s *MatchmakingService) processPackRequests(currentState protocol.TokenState) protocol.TokenState {
+	requests := s.stateManager.DequeueAllPackRequests()
+	if len(requests) == 0 {
+		return currentState // Sem pedidos, estado não muda.
+	}
+
+	log.Printf("[MATCHMAKING] A processar %d pedidos de pacotes...", len(requests))
+
+	for _, req := range requests {
+		if currentState.PackStock > 0 {
+			// Há estoque, processa o pedido.
+			currentState.PackStock--
+			cards := s.stateManager.PackSystem.GenerateCardsForPack()
+
+			// Envia o resultado de volta para a goroutine do jogador.
+			req.ReplyChan <- state.PackResult{Cards: cards}
+
+			log.Printf("[MATCHMAKING] Pacote aberto para %s. Cartas: %v. Estoque restante: %d", req.PlayerID, cards, currentState.PackStock)
+		} else {
+			// Estoque esgotado.
+			req.ReplyChan <- state.PackResult{Err: errors.New("estoque de pacotes esgotado")}
+			log.Printf("[MATCHMAKING] Pedido de pacote de %s rejeitado. Estoque esgotado.", req.PlayerID)
+		}
+	}
+
+	return currentState
 }
 
 // processMatchmakingQueue verifica a fila de jogadores e tenta criar partidas.
@@ -121,7 +156,7 @@ func (s *MatchmakingService) findAndCreateDistributedMatch(localPlayer *protocol
 			log.Printf("[MATCHMAKING] Erro ao criar partida distribuída localmente: %v", err)
 			return false
 		}
-		
+
 		log.Printf("[MATCHMAKING] Partida distribuída %s criada com sucesso!", matchID)
 		s.notifyPlayersOfMatch(match, localPlayer, match.P2)
 		go s.monitorMatch(match)
@@ -131,9 +166,18 @@ func (s *MatchmakingService) findAndCreateDistributedMatch(localPlayer *protocol
 }
 
 // passTokenToNextServer envia uma requisição HTTP para passar o token.
-func (s *MatchmakingService) passTokenToNextServer() {
-	log.Printf("[MATCHMAKING] A passar o token para %s...", s.nextServerAddress)
-	_, err := s.httpClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", nil)
+func (s *MatchmakingService) passTokenToNextServer(currentState protocol.TokenState) {
+	log.Printf("[MATCHMAKING] A passar o token para %s com estado: %+v...", s.nextServerAddress, currentState)
+
+	requestBody, err := json.Marshal(currentState)
+	if err != nil {
+		log.Printf("[MATCHMAKING] ERRO ao serializar o estado do token: %v", err)
+		// Decide o que fazer aqui - talvez passar um estado padrão ou tentar novamente?
+		// Por agora, vamos apenas logar e não passar o token.
+		return
+	}
+
+	_, err = s.httpClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(requestBody))
 	if err != nil {
 		log.Printf("[MATCHMAKING] ERRO ao passar o token para %s: %v.", s.nextServerAddress, err)
 	} else {

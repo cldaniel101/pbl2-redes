@@ -12,6 +12,18 @@ import (
 	"time"
 )
 
+// PackResult é a estrutura para enviar o resultado da abertura de um pacote.
+type PackResult struct {
+	Cards []string
+	Err   error
+}
+
+// PackRequest representa um pedido de abertura de pacote de um jogador.
+type PackRequest struct {
+	PlayerID  string
+	ReplyChan chan<- PackResult
+}
+
 // DistributedMatch armazena informações sobre partidas que ocorrem entre diferentes servidores.
 type DistributedMatch struct {
 	MatchID     string
@@ -31,6 +43,7 @@ type StateManager struct {
 	MatchmakingQueue   []*protocol.PlayerConn
 	ActiveMatches      map[string]*game.Match
 	DistributedMatches map[string]*DistributedMatch
+	PackRequestQueue   []*PackRequest
 }
 
 // NewStateManager cria e inicializa um novo gerenciador de estado.
@@ -52,6 +65,7 @@ func NewStateManager() *StateManager {
 		MatchmakingQueue:   make([]*protocol.PlayerConn, 0),
 		ActiveMatches:      make(map[string]*game.Match),
 		DistributedMatches: make(map[string]*DistributedMatch),
+		PackRequestQueue:   make([]*PackRequest, 0),
 	}
 }
 
@@ -60,6 +74,29 @@ func (sm *StateManager) AddPlayerOnline(player *protocol.PlayerConn) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.PlayersOnline[player.ID] = player
+}
+
+// EnqueuePackRequest adiciona um pedido de abertura de pacote à fila.
+func (sm *StateManager) EnqueuePackRequest(request *PackRequest) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.PackRequestQueue = append(sm.PackRequestQueue, request)
+	log.Printf("[STATE] Pedido de pacote de %s enfileirado. Tamanho da fila: %d", request.PlayerID, len(sm.PackRequestQueue))
+}
+
+// DequeueAllPackRequests retorna todos os pedidos da fila e limpa-a.
+func (sm *StateManager) DequeueAllPackRequests() []*PackRequest {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if len(sm.PackRequestQueue) == 0 {
+		return nil
+	}
+
+	requests := sm.PackRequestQueue
+	sm.PackRequestQueue = make([]*PackRequest, 0)
+	log.Printf("[STATE] %d pedidos de pacote removidos da fila para processamento.", len(requests))
+	return requests
 }
 
 // RemovePlayerOnline remove um jogador do mapa de jogadores online.
@@ -226,7 +263,7 @@ func (sm *StateManager) ConfirmAndCreateDistributedMatch(matchID, guestPlayerID,
 	// for necessário um objeto Match no servidor convidado, mas pode ser útil).
 	hostPlayerConn := protocol.NewPlayerConn(hostPlayerID, nil)
 	match := game.NewMatch(matchID, hostPlayerConn, guestPlayer, sm.CardDB, broker, sm) // Broker é nil aqui
-	sm.ActiveMatches[matchID] = match	
+	sm.ActiveMatches[matchID] = match
 
 	log.Printf("[STATE] Partida distribuída %s confirmada para o jogador local %s.", matchID, guestPlayerID)
 

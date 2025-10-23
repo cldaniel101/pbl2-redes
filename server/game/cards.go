@@ -164,6 +164,17 @@ func (ps *PackSystem) OpenPack(playerID string) ([]string, error) {
 	return cards, nil
 }
 
+// GenerateCardsForPack apenas sorteia as cartas para um pacote, sem alterar o estoque.
+// O controle de estoque é feito pelo detentor do token.
+func (ps *PackSystem) GenerateCardsForPack() []string {
+	// Sorteia cartas
+	cards := make([]string, ps.config.CardsPerPack)
+	for i := 0; i < ps.config.CardsPerPack; i++ {
+		cards[i] = ps.cardDB.GetRandomCard()
+	}
+	return cards
+}
+
 // GetStock retorna o estoque atual
 func (ps *PackSystem) GetStock() int {
 	ps.mu.Lock()
