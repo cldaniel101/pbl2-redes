@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"strconv"
 	"time"
 
 	"pingpong/server/protocol"
@@ -157,7 +159,10 @@ func (s *TCPServer) handleOpenPack(player *protocol.PlayerConn) {
 	}
 	s.stateManager.EnqueuePackRequest(request)
 
-	// 3. Aguardar pelo resultado com um timeout.
+	// 3. Obter timeout configurável (padrão: 10 segundos)
+	timeout := getPackRequestTimeout()
+
+	// 4. Aguardar pelo resultado com um timeout.
 	select {
 	case result := <-replyChan:
 		// O resultado chegou do processador do token.
@@ -176,15 +181,32 @@ func (s *TCPServer) handleOpenPack(player *protocol.PlayerConn) {
 			})
 			log.Printf("[HANDLER] %s abriu um pacote (processado via token): %v", player.ID, result.Cards)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(timeout):
 		// Timeout - o token pode estar demorando muito ou perdido.
 		s.sendToPlayer(player.ID, protocol.ServerMsg{
 			T:    protocol.ERROR,
 			Code: "REQUEST_TIMEOUT",
 			Msg:  "O pedido para abrir o pacote demorou demasiado a ser processado.",
 		})
-		log.Printf("[HANDLER] Timeout ao aguardar resultado do pacote para %s", player.ID)
+		log.Printf("[HANDLER] Timeout ao aguardar resultado do pacote para %s (timeout: %v)", player.ID, timeout)
 	}
+}
+
+// getPackRequestTimeout retorna o timeout configurado para pedidos de pacotes.
+// Pode ser configurado via variável de ambiente PACK_REQUEST_TIMEOUT_SEC (padrão: 10 segundos).
+func getPackRequestTimeout() time.Duration {
+	timeoutStr := os.Getenv("PACK_REQUEST_TIMEOUT_SEC")
+	if timeoutStr == "" {
+		return 10 * time.Second
+	}
+
+	timeoutSec, err := strconv.Atoi(timeoutStr)
+	if err != nil || timeoutSec <= 0 {
+		log.Printf("[HANDLER] Valor inválido para PACK_REQUEST_TIMEOUT_SEC: %s, usando padrão de 10s", timeoutStr)
+		return 10 * time.Second
+	}
+
+	return time.Duration(timeoutSec) * time.Second
 }
 
 func (s *TCPServer) handleAutoPlay(player *protocol.PlayerConn, enable bool) {

@@ -26,6 +26,8 @@ type MatchmakingService struct {
 	nextServerAddress string                   // O próximo servidor no anel
 	tokenChan         chan protocol.TokenState // Canal para receber e (no líder) reinjetar o token
 	isLeader          bool                     // Flag para indicar se este nó é o líder
+	lastKnownStock    int                      // Último estoque conhecido (para regeneração inteligente)
+	totalPacksOpened  int                      // Total de pacotes abertos desde o início
 }
 
 // NewService cria uma nova instância do serviço de matchmaking.
@@ -42,6 +44,8 @@ func NewService(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan pr
 		nextServerAddress: nextAddr,
 		tokenChan:         tokenChan,
 		isLeader:          isLeader,
+		lastKnownStock:    1000, // Estoque inicial padrão
+		totalPacksOpened:  0,
 	}
 }
 
@@ -98,11 +102,13 @@ func (s *MatchmakingService) runLeader() {
 
 		case <-timer.C:
 			log.Println("[MATCHMAKING] [LEADER] Watchdog timeout: Token perdido! A regenerar...")
-			// Regenera o token e injeta-o no seu próprio canal para iniciar o processamento.
-			// A outra case do select irá capturá-lo imediatamente.
-			initialStock := 1000 // Estratégia simples de recuperação
-			log.Printf("[MATCHMAKING] [LEADER] A injetar novo estado no token: %d pacotes", initialStock)
-			s.tokenChan <- protocol.TokenState{PackStock: initialStock}
+			// Regenera o token com o último estado conhecido.
+			// Usa o lastKnownStock como base para a regeneração.
+			recoveredStock := s.lastKnownStock
+			log.Printf("[MATCHMAKING] [LEADER] A regenerar token com último estoque conhecido: %d pacotes", recoveredStock)
+			log.Printf("[MATCHMAKING] [LEADER] Total de pacotes abertos desde o início: %d", s.totalPacksOpened)
+			log.Printf("[MATCHMAKING] [LEADER] ⚠️  AVISO: Regeneração de token pode causar inconsistência se houver pacotes em processamento.")
+			s.tokenChan <- protocol.TokenState{PackStock: recoveredStock}
 			// O timer será resetado na case de recepção do token.
 		}
 	}
@@ -113,15 +119,19 @@ func (s *MatchmakingService) runLeader() {
 func (s *MatchmakingService) processPackRequests(currentState protocol.TokenState) protocol.TokenState {
 	requests := s.stateManager.DequeueAllPackRequests()
 	if len(requests) == 0 {
+		// Atualiza o último estoque conhecido mesmo sem pedidos
+		s.lastKnownStock = currentState.PackStock
 		return currentState // Sem pedidos, estado não muda.
 	}
 
-	log.Printf("[MATCHMAKING] A processar %d pedidos de pacotes...", len(requests))
+	log.Printf("[MATCHMAKING] A processar %d pedidos de pacotes. Estoque atual: %d", len(requests), currentState.PackStock)
 
+	packsBefore := currentState.PackStock
 	for _, req := range requests {
 		if currentState.PackStock > 0 {
 			// Há estoque, processa o pedido.
 			currentState.PackStock--
+			s.totalPacksOpened++ // Incrementa contador de auditoria
 			cards := s.stateManager.PackSystem.GenerateCardsForPack()
 
 			// Envia o resultado de volta para a goroutine do jogador.
@@ -133,6 +143,14 @@ func (s *MatchmakingService) processPackRequests(currentState protocol.TokenStat
 			req.ReplyChan <- state.PackResult{Err: errors.New("estoque de pacotes esgotado")}
 			log.Printf("[MATCHMAKING] Pedido de pacote de %s rejeitado. Estoque esgotado.", req.PlayerID)
 		}
+	}
+
+	// Atualiza o último estoque conhecido e registra auditoria
+	s.lastKnownStock = currentState.PackStock
+	packsOpened := packsBefore - currentState.PackStock
+	if packsOpened > 0 {
+		log.Printf("[MATCHMAKING] 📦 Auditoria: %d pacotes abertos nesta rodada. Total acumulado: %d. Estoque atual: %d",
+			packsOpened, s.totalPacksOpened, currentState.PackStock)
 	}
 
 	return currentState

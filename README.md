@@ -103,6 +103,7 @@ LISTEN_ADDR=:9000          # Porta TCP para clientes
 API_ADDR=:8000             # Porta HTTP para API inter-servidores
 ALL_SERVERS=http://server-1:8000,http://server-2:8000,http://server-3:8000
 HOSTNAME=server-1          # Nome do host (server-1, server-2, server-3)
+PACK_REQUEST_TIMEOUT_SEC=10  # Timeout para pedidos de pacotes em segundos (padrão: 10)
 ```
 
 ### Cliente
@@ -344,12 +345,39 @@ docker-compose down -v --rmi all
 docker system prune -a
 ```
 
+## 🛡️ Tolerância a Falhas e Melhorias
+
+### Regeneração Inteligente de Token
+O sistema implementa um watchdog no servidor líder que monitora a circulação do token:
+- **Timeout dinâmico:** 4 segundos × número de servidores no anel
+- **Regeneração com estado:** Usa o último estoque conhecido ao invés de resetar para valor inicial
+- **Log de auditoria:** Rastreia total de pacotes abertos desde o início
+- **Avisos de inconsistência:** Notifica quando regeneração pode causar estado inconsistente
+
+### Timeout Configurável
+O timeout para pedidos de pacotes pode ser ajustado via variável de ambiente:
+```bash
+PACK_REQUEST_TIMEOUT_SEC=10  # Padrão: 10 segundos
+```
+
+### Tratamento de Falhas em Partidas Distribuídas
+- Falhas S2S (servidor-servidor) são detectadas com timeout de 5s
+- Partidas afetadas são encerradas com mensagem clara: `VICTORY_BY_DISCONNECT`
+- Estado do oponente remoto é limpo automaticamente
+- Cliente recebe notificação compreensível do motivo do encerramento
+
+### Logs Estruturados
+- Todos os logs incluem tags de contexto: `[MATCHMAKING]`, `[HANDLER]`, `[MATCH]`, etc.
+- Logs de auditoria com emoji 📦 para facilitar rastreamento de pacotes
+- Logs de aviso ⚠️ para situações críticas de regeneração
+
 ## 📚 Documentação Adicional
 
 - [Regras do Jogo](GAME_RULES.md)
 - [Descrição do Problema](PROBLEM_DESCRIPTION.md)
 - [Arquitetura Distribuída](docs/F0%20-%20arquitetura_distribuida.md)
 - [API e Orquestração](docs/F1%20-%20API%20e%20Orquestração%20de%20Jogadas%20S2S.md)
+- [Relatório de Verificação](VERIFICATION_REPORT.md) - Análise completa das funcionalidades implementadas
 
 ## 🤝 Contribuição
 

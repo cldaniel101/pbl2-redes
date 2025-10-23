@@ -192,7 +192,7 @@ func (m *Match) resolveRound() {
 
 	// Limpa as jogadas
 	m.Waiting = make(map[string]string)
-	fmt.Println("\n\n\n\n" + fmt.Sprintf("%v", m.Waiting) + "\n\n\n\n")
+	log.Printf("[MATCH %s] Jogadas limpas para próxima rodada. Estado: %v", m.ID, m.Waiting)
 	m.Round++
 
 	// Verifica fim do jogo
