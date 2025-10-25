@@ -439,34 +439,32 @@ func (m *Match) sendToPlayer(playerID string, msg protocol.ServerMsg) {
 	}
 }
 
-// sendToPlayerSmart decide se envia uma mensagem localmente ou retransmite.
+// sendToPlayerSmart decide se envia uma mensagem localmente via broker ou
+// retransmite para outro servidor.
 func (m *Match) sendToPlayerSmart(playerID string, msg protocol.ServerMsg) {
 	distMatch, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
+
+	// Se não for uma partida distribuída, envia sempre localmente.
 	if !isDistributed {
 		m.sendToPlayer(playerID, msg)
 		return
 	}
 
+	// Verifica se o jogador alvo é o anfitrião ou o convidado.
+	isTargetHost := distMatch.HostPlayer == playerID
+	isTargetGuest := distMatch.GuestPlayer == playerID
+
+	// Se o jogador não pertence a esta partida distribuída, não faz nada.
+	if !isTargetHost && !isTargetGuest {
+		return
+	}
+
+	// Verifica se o jogador está neste servidor.
 	isPlayerLocal := m.informer.IsPlayerOnline(playerID)
+
 	if isPlayerLocal {
 		m.sendToPlayer(playerID, msg)
-	} else {
-		// O jogador não está neste servidor, retransmite a mensagem.
-		var opponentServer string
-		var localPlayerID string
-		if distMatch.HostPlayer == playerID {
-			opponentServer = distMatch.HostServer
-			localPlayerID = distMatch.GuestPlayer
-		} else {
-			opponentServer = distMatch.GuestServer
-			localPlayerID = distMatch.HostPlayer
-		}
-
-		if err := s2s.ForwardMessage(opponentServer, playerID, msg); err != nil {
-			log.Printf("[MATCH %s] Falha S2S ao retransmitir mensagem para %s. Encerrando partida. Erro: %v", m.ID, playerID, err)
-			m.endDueToError(localPlayerID, err)
-		}
-	}
+	} 
 }
 
 // forwardPlayIfNeeded retransmite a jogada e retorna um erro em caso de falha.
