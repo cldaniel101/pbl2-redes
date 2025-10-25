@@ -86,11 +86,15 @@ func (s *MatchmakingService) runLeader() {
 				return
 			}
 
+			// Token recebido (do anel ou da injeção inicial)
 			log.Printf("[MATCHMAKING] [LEADER] Token recebido. Watchdog resetado.")
 			if !timer.Stop() {
-				// Esvazia o canal do timer se Stop() retornar false, o que é necessário
-				// se o timer já tiver disparado e o evento estiver pendente.
-				<-timer.C
+				// Esvazia o canal do timer se Stop() retornar false
+				// (necessário se o timer disparou mas o evento ainda não foi lido)
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
 			timer.Reset(watchdogTimeout)
 
@@ -101,15 +105,58 @@ func (s *MatchmakingService) runLeader() {
 			s.passTokenToNextServer(updatedTokenState)
 
 		case <-timer.C:
+			// --- INÍCIO DA ALTERAÇÃO ---
+			// O token foi perdido. O Líder deve regenerar, processar e repassar.
 			log.Println("[MATCHMAKING] [LEADER] Watchdog timeout: Token perdido! A regenerar...")
-			// Regenera o token com o último estado conhecido.
-			// Usa o lastKnownStock como base para a regeneração.
+
+			// 1. Reconfigura o anel para pular o nó presumidamente falho.
+			myIndex := -1
+			for i, addr := range s.allServers {
+				if addr == s.serverAddress {
+					myIndex = i
+					break
+				}
+			}
+
+			if myIndex == -1 {
+				log.Printf("[MATCHMAKING] [LEADER] ERRO CRÍTICO: Não foi possível encontrar o próprio endereço (%s) na lista de servidores.", s.serverAddress)
+				// Não podemos continuar, apenas resetamos o timer e esperamos.
+				timer.Reset(watchdogTimeout)
+				continue
+			}
+			
+			// Calcula o novo próximo índice: (índice_atual + 2) % tamanho_total
+			newNextIndex := (myIndex + 2) % len(s.allServers)
+			originalNext := s.nextServerAddress
+			presumedFailedIndex := (myIndex + 1) % len(s.allServers)
+			
+			s.nextServerAddress = s.allServers[newNextIndex]
+			
+			log.Printf("[MATCHMAKING] [LEADER] Topologia do anel reconfigurada.")
+			log.Printf("[MATCHMAKING] [LEADER] Nó presumidamente falho: %s (em %s)", originalNext, s.allServers[presumedFailedIndex])
+			log.Printf("[MATCHMAKING] [LEADER] O próximo nó agora é: %s (em %s)", s.nextServerAddress, s.allServers[newNextIndex])
+
+			// 2. Regenera o token com o último estado conhecido.
 			recoveredStock := s.lastKnownStock
 			log.Printf("[MATCHMAKING] [LEADER] A regenerar token com último estoque conhecido: %d pacotes", recoveredStock)
 			log.Printf("[MATCHMAKING] [LEADER] Total de pacotes abertos desde o início: %d", s.totalPacksOpened)
-			log.Printf("[MATCHMAKING] [LEADER] ⚠️  AVISO: Regeneração de token pode causar inconsistência se houver pacotes em processamento.")
-			s.tokenChan <- protocol.TokenState{PackStock: recoveredStock}
-			// O timer será resetado na case de recepção do token.
+			
+			tokenState := protocol.TokenState{PackStock: recoveredStock}
+
+			// 3. Processa as filas locais (o mesmo que faria se recebesse o token).
+			// Isso evita o deadlock de enviar para o próprio canal.
+			log.Println("[MATCHMAKING] [LEADER] A processar filas locais antes de repassar token regenerado...")
+			updatedTokenState := s.processPackRequests(tokenState)
+			s.processMatchmakingQueue()
+			time.Sleep(2 * time.Second) // Simula trabalho
+
+			// 4. Passa o token regenerado e processado para o *novo* próximo servidor.
+			s.passTokenToNextServer(updatedTokenState)
+			
+			// 5. Reseta o watchdog.
+			log.Println("[MATCHMAKING] [LEADER] Watchdog resetado após regeneração.")
+			timer.Reset(watchdogTimeout)
+			// --- FIM DA ALTERAÇÃO ---
 		}
 	}
 }
