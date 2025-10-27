@@ -44,11 +44,12 @@ type StateManager struct {
 	ActiveMatches      map[string]*game.Match
 	DistributedMatches map[string]*DistributedMatch
 	PackRequestQueue   []*PackRequest
+	AllServers         []string // Lista de todos os servidores no cluster
 }
 
 // NewStateManager cria e inicializa um novo gerenciador de estado.
 // Ele é responsável por carregar recursos iniciais como a base de dados de cartas.
-func NewStateManager() *StateManager {
+func NewStateManager(allServers []string) *StateManager {
 	cardDB := game.NewCardDB()
 	if err := cardDB.LoadFromFile("cards.json"); err != nil {
 		log.Fatalf("[STATE] Erro fatal ao carregar base de dados de cartas: %v", err)
@@ -66,6 +67,7 @@ func NewStateManager() *StateManager {
 		ActiveMatches:      make(map[string]*game.Match),
 		DistributedMatches: make(map[string]*DistributedMatch),
 		PackRequestQueue:   make([]*PackRequest, 0),
+		AllServers:         allServers,
 	}
 }
 
@@ -455,4 +457,11 @@ func (sm *StateManager) IsPlayerOnline(playerID string) bool {
 
 	_, ok := sm.PlayersOnline[playerID]
 	return ok
+}
+
+// GetAllServers implementa a interface game.StateInformer.
+func (sm *StateManager) GetAllServers() []string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.AllServers
 }

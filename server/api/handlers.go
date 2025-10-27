@@ -17,6 +17,11 @@ type TokenReceiver interface {
 	SetToken(t *token.Token)
 }
 
+// CardProvider define a interface para fornecer cartas do token
+type CardProvider interface {
+	RequestCardsFromToken(count int) ([]string, error)
+}
+
 // APIServer lida com as requisições HTTP da API inter-servidores.
 type APIServer struct {
 	stateManager *state.StateManager
@@ -26,16 +31,18 @@ type APIServer struct {
 	// o serviço de matchmaking quando o token for recebido.
 	tokenAcquiredChan chan<- bool
 	tokenReceiver     TokenReceiver
+	cardProvider      CardProvider
 }
 
 // NewServer cria uma nova instância do servidor da API.
-func NewServer(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan<- bool, serverAddr string, tokenReceiver TokenReceiver) *APIServer {
+func NewServer(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan<- bool, serverAddr string, tokenReceiver TokenReceiver, cardProvider CardProvider) *APIServer {
 	return &APIServer{
 		stateManager:      sm,
 		broker:            broker,
 		tokenAcquiredChan: tokenChan,
 		serverAddr:        serverAddr,
 		tokenReceiver:     tokenReceiver,
+		cardProvider:      cardProvider,
 	}
 }
 
@@ -45,7 +52,8 @@ func (s *APIServer) Router() http.Handler {
 	mux.HandleFunc("/api/find-opponent", s.handleFindOpponent)
 	mux.HandleFunc("/api/request-match", s.handleRequestMatch)
 	mux.HandleFunc("/api/receive-token", s.handleReceiveToken)
-	mux.HandleFunc("/matches/", s.handleMatchAction) // Novo endpoint para ações da partida
+	mux.HandleFunc("/api/request-cards", s.handleRequestCards) // Novo endpoint para solicitar cartas
+	mux.HandleFunc("/matches/", s.handleMatchAction)           // Novo endpoint para ações da partida
 	mux.HandleFunc("/api/forward/message", s.handleForwardMessage)
 	return mux
 }
@@ -240,4 +248,35 @@ func (s *APIServer) handleForwardMessage(w http.ResponseWriter, r *http.Request)
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleRequestCards processa pedidos de cartas do token
+func (s *APIServer) handleRequestCards(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Count int `json:"count"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Pedido inválido", http.StatusBadRequest)
+		return
+	}
+
+	if req.Count <= 0 || req.Count > 10 {
+		http.Error(w, "Número de cartas inválido (deve ser entre 1 e 10)", http.StatusBadRequest)
+		return
+	}
+
+	// Tenta obter as cartas do token
+	cards, err := s.cardProvider.RequestCardsFromToken(req.Count)
+	if err != nil {
+		log.Printf("[API] Erro ao fornecer cartas: %v", err)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	log.Printf("[API] Fornecidas %d cartas para requisição externa", len(cards))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"cards": cards,
+	})
 }

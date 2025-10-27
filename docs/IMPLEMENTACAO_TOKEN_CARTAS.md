@@ -107,25 +107,28 @@ Novos métodos para criar partidas com cartas predefinidas:
 - Usa slice do Go: `t.CardPool = t.CardPool[count:]`
 - Operação é atômica (protegida por mutex)
 
-## ⚠️ Consideração Importante: Reabastecimento Durante Partida
+## ✅ ATUALIZAÇÃO: Reabastecimento Durante Partida CORRIGIDO
 
-Durante uma partida, o método `refillHands()` ainda usa o `CardDB.GetRandomCard()` local.
+~~Durante uma partida, o método `refillHands()` ainda usa o `CardDB.GetRandomCard()` local.~~
 
-**Por que não é um problema crítico:**
+**CORREÇÃO IMPLEMENTADA (27/10/2025):**
 
-1. **Cartas iniciais vêm do token**: Cada partida recebe 10 cartas do token no início
-2. **Pool grande**: 900 cartas iniciais (suficiente para ~90 partidas antes de reabastecer)
-3. **Partidas curtas**: A maioria termina antes de esgotar as mãos iniciais
-4. **Fallback funcional**: Se precisar, `CardDB` local fornece cartas extras
+O sistema agora **puxa cartas do token via HTTP** durante o reabastecimento de mão!
 
-**Se quiser melhorar no futuro:**
+### Como funciona agora:
 
-Para implementar reabastecimento completo do token durante a partida seria necessário:
-- Adicionar endpoint para "requisitar cartas"
-- Servidor solicita cartas ao servidor atual com o token
-- Espera resposta HTTP (adiciona latência)
-- Sincroniza cartas entre servidores de partidas distribuídas
-- Complexidade significativa para um caso de uso raro
+1. **Requisição HTTP**: `Match.refillHands()` faz requisições HTTP para `/api/request-cards`
+2. **Tenta todos os servidores**: Percorre lista de servidores até encontrar um com o token
+3. **Servidor com token responde**: Retira cartas do token e retorna via JSON
+4. **Fallback seguro**: Se nenhum servidor responder, usa `CardDB` local como backup
+
+### Arquivos envolvidos:
+- ✅ `server/game/match.go` - Métodos `refillHands()`, `requestCardsFromToken()`, `tryRequestCardsFromServer()`
+- ✅ `server/api/handlers.go` - Endpoint `handleRequestCards()`
+- ✅ `server/matchmaking/service.go` - Método `RequestCardsFromToken()`
+- ✅ `server/state/manager.go` - Método `GetAllServers()`
+
+**Veja documentação completa em**: `docs/CORRECOES_TOKEN_E_SERVIDOR.md`
 
 ## 📊 Fluxo Completo do Sistema
 
@@ -227,14 +230,19 @@ A implementação está **completa e funcional**. O sistema agora:
 - ✅ Distribui cartas do token ao criar partidas
 - ✅ Remove cartas usadas do token
 - ✅ Reabastece automaticamente quando necessário
+- ✅ **[NOVO]** Reabastecimento de mão durante partida via HTTP
+- ✅ **[NOVO]** Detecção de queda do servidor com feedback ao cliente
 - ✅ Funciona em ambiente distribuído
 - ✅ É thread-safe e tolerante a falhas
 
-A única limitação conhecida (reabastecimento durante partida) é **mínima** e tem um **fallback funcional** que não afeta a jogabilidade normal.
+~~A única limitação conhecida (reabastecimento durante partida) é **mínima** e tem um **fallback funcional** que não afeta a jogabilidade normal.~~
+
+**ATUALIZAÇÃO**: Não há mais limitações! Todos os problemas foram corrigidos.
 
 ## 📚 Documentação Adicional
 
 Para mais detalhes, consulte:
 - `docs/F2 - Token com Stack Global de Cartas.md` - Documentação técnica completa
 - `docs/TESTANDO_TOKEN_COM_CARTAS.md` - Guia de testes e validação
+- `docs/CORRECOES_TOKEN_E_SERVIDOR.md` - **[NOVO]** Correções de reabastecimento e detecção de queda
 

@@ -43,7 +43,7 @@ func main() {
 	log.Printf("[MAIN] Topologia do anel configurada. Eu sou %s. O próximo é %s.", thisServerAddress, nextServerAddress)
 
 	// 2. Inicialização dos Componentes Centrais
-	stateManager := state.NewStateManager()
+	stateManager := state.NewStateManager(allServers)
 	broker := pubsub.NewBroker()
 
 	// Canal para o APIServer notificar o MatchmakingService quando o token chegar.
@@ -88,7 +88,8 @@ func main() {
 		broker,
 		tokenAcquiredChan,
 		thisServerAddress,
-		matchmakingService,
+		matchmakingService, // TokenReceiver
+		matchmakingService, // CardProvider
 	)
 
 	// Servidor TCP (para comunicação com os clientes)

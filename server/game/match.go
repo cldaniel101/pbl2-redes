@@ -1,9 +1,13 @@
 package game
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math/rand"
+	"net/http"
 	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
 	"pingpong/server/s2s"
@@ -26,43 +30,48 @@ type DistributedMatchInfo struct {
 type StateInformer interface {
 	GetDistributedMatchInfo(matchID string) (DistributedMatchInfo, bool)
 	IsPlayerOnline(playerID string) bool
+	GetAllServers() []string
 }
 
 // Match representa uma partida 1v1
 type Match struct {
-	ID       string
-	P1       *protocol.PlayerConn
-	P2       *protocol.PlayerConn
-	HP       [2]int
-	Hands    [2]Hand
-	Discard  [2][]string
-	Round    int
-	State    MatchState
-	Waiting  map[string]string // playerID -> cardID jogado
-	Deadline time.Time
-	CardDB   *CardDB
-	mu       sync.Mutex
-	done     chan bool
-	broker   *pubsub.Broker
-	informer StateInformer
+	ID         string
+	P1         *protocol.PlayerConn
+	P2         *protocol.PlayerConn
+	HP         [2]int
+	Hands      [2]Hand
+	Discard    [2][]string
+	Round      int
+	State      MatchState
+	Waiting    map[string]string // playerID -> cardID jogado
+	Deadline   time.Time
+	CardDB     *CardDB
+	mu         sync.Mutex
+	done       chan bool
+	broker     *pubsub.Broker
+	informer   StateInformer
+	allServers []string // Lista de todos os servidores no cluster
+	httpClient *http.Client
 }
 
 // NewMatch cria uma nova partida
 func NewMatch(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pubsub.Broker, informer StateInformer) *Match {
 	match := &Match{
-		ID:       id,
-		P1:       p1,
-		P2:       p2,
-		HP:       [2]int{HPStart, HPStart},
-		Hands:    [2]Hand{},
-		Discard:  [2][]string{{}, {}},
-		Round:    1,
-		State:    StateAwaitingPlays,
-		Waiting:  make(map[string]string),
-		CardDB:   cardDB,
-		done:     make(chan bool, 1),
-		broker:   broker,
-		informer: informer,
+		ID:         id,
+		P1:         p1,
+		P2:         p2,
+		HP:         [2]int{HPStart, HPStart},
+		Hands:      [2]Hand{},
+		Discard:    [2][]string{{}, {}},
+		Round:      1,
+		State:      StateAwaitingPlays,
+		Waiting:    make(map[string]string),
+		CardDB:     cardDB,
+		done:       make(chan bool, 1),
+		broker:     broker,
+		informer:   informer,
+		allServers: informer.GetAllServers(),
+		httpClient: &http.Client{Timeout: 2 * time.Second},
 	}
 
 	// Gera mãos iniciais
@@ -74,19 +83,21 @@ func NewMatch(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pu
 // NewMatchWithCards cria uma nova partida com cartas predefinidas do token
 func NewMatchWithCards(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pubsub.Broker, informer StateInformer, p1Cards, p2Cards []string) *Match {
 	match := &Match{
-		ID:       id,
-		P1:       p1,
-		P2:       p2,
-		HP:       [2]int{HPStart, HPStart},
-		Hands:    [2]Hand{},
-		Discard:  [2][]string{{}, {}},
-		Round:    1,
-		State:    StateAwaitingPlays,
-		Waiting:  make(map[string]string),
-		CardDB:   cardDB,
-		done:     make(chan bool, 1),
-		broker:   broker,
-		informer: informer,
+		ID:         id,
+		P1:         p1,
+		P2:         p2,
+		HP:         [2]int{HPStart, HPStart},
+		Hands:      [2]Hand{},
+		Discard:    [2][]string{{}, {}},
+		Round:      1,
+		State:      StateAwaitingPlays,
+		Waiting:    make(map[string]string),
+		CardDB:     cardDB,
+		done:       make(chan bool, 1),
+		broker:     broker,
+		informer:   informer,
+		allServers: informer.GetAllServers(),
+		httpClient: &http.Client{Timeout: 2 * time.Second},
 	}
 
 	// Define as mãos iniciais com as cartas do token
@@ -263,14 +274,87 @@ func (m *Match) removeCardFromHand(playerIndex int, cardID string) {
 
 // refillHands repõe as mãos até o tamanho máximo
 func (m *Match) refillHands() {
+	// Calcula quantas cartas são necessárias
+	totalCardsNeeded := 0
 	for playerIndex := 0; playerIndex < 2; playerIndex++ {
-		for len(m.Hands[playerIndex]) < HandSize {
-			newCard := m.CardDB.GetRandomCard()
-			if newCard != "" {
-				m.Hands[playerIndex] = append(m.Hands[playerIndex], newCard)
+		cardsNeeded := HandSize - len(m.Hands[playerIndex])
+		totalCardsNeeded += cardsNeeded
+	}
+
+	if totalCardsNeeded == 0 {
+		return // Nenhuma carta necessária
+	}
+
+	// Tenta obter cartas do token via requisições HTTP
+	cards := m.requestCardsFromToken(totalCardsNeeded)
+
+	if len(cards) == 0 {
+		// Fallback: usa o CardDB local se não conseguiu cartas do token
+		log.Printf("[MATCH %s] Não conseguiu cartas do token, usando fallback do CardDB local", m.ID)
+		for playerIndex := 0; playerIndex < 2; playerIndex++ {
+			for len(m.Hands[playerIndex]) < HandSize {
+				newCard := m.CardDB.GetRandomCard()
+				if newCard != "" {
+					m.Hands[playerIndex] = append(m.Hands[playerIndex], newCard)
+				}
 			}
 		}
+		return
 	}
+
+	// Distribui as cartas recebidas do token
+	cardIndex := 0
+	for playerIndex := 0; playerIndex < 2 && cardIndex < len(cards); playerIndex++ {
+		for len(m.Hands[playerIndex]) < HandSize && cardIndex < len(cards) {
+			m.Hands[playerIndex] = append(m.Hands[playerIndex], cards[cardIndex])
+			cardIndex++
+		}
+	}
+
+	log.Printf("[MATCH %s] Mãos repostas com %d cartas do token", m.ID, cardIndex)
+}
+
+// requestCardsFromToken tenta requisitar cartas de qualquer servidor que possua o token
+func (m *Match) requestCardsFromToken(count int) []string {
+	// Tenta requisitar de cada servidor
+	for _, serverAddr := range m.allServers {
+		cards, err := m.tryRequestCardsFromServer(serverAddr, count)
+		if err == nil && len(cards) > 0 {
+			log.Printf("[MATCH %s] Obtidas %d cartas do servidor %s", m.ID, len(cards), serverAddr)
+			return cards
+		}
+		// Se falhou, tenta o próximo servidor
+	}
+
+	log.Printf("[MATCH %s] Nenhum servidor conseguiu fornecer cartas do token", m.ID)
+	return []string{}
+}
+
+// tryRequestCardsFromServer tenta requisitar cartas de um servidor específico
+func (m *Match) tryRequestCardsFromServer(serverAddr string, count int) ([]string, error) {
+	requestBody, _ := json.Marshal(map[string]interface{}{
+		"count": count,
+	})
+
+	resp, err := m.httpClient.Post(serverAddr+"/api/request-cards", "application/json", bytes.NewBuffer(requestBody))
+	if err != nil {
+		return nil, fmt.Errorf("erro na requisição HTTP: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return nil, fmt.Errorf("servidor retornou status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Cards []string `json:"cards"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("erro ao decodificar resposta: %w", err)
+	}
+
+	return result.Cards, nil
 }
 
 // createRoundLogs cria os logs da rodada
@@ -489,6 +573,49 @@ func (m *Match) sendToPlayerSmart(playerID string, msg protocol.ServerMsg) {
 
 	if isPlayerLocal {
 		m.sendToPlayer(playerID, msg)
+	} else {
+		// Jogador está em servidor remoto, tenta enviar via S2S
+		var remoteServer string
+		var localPlayerID string
+
+		if isTargetHost {
+			remoteServer = distMatch.HostServer
+			localPlayerID = distMatch.GuestPlayer
+		} else {
+			remoteServer = distMatch.GuestServer
+			localPlayerID = distMatch.HostPlayer
+		}
+
+		// Tenta enviar mensagem para servidor remoto
+		err := s2s.ForwardMessage(remoteServer, playerID, msg)
+		if err != nil {
+			// Falha na comunicação - servidor remoto caiu
+			// Mas só notifica se não for uma mensagem de SERVER_DOWN ou MATCH_END
+			// (para evitar loops)
+			if msg.T != protocol.SERVER_DOWN && msg.T != protocol.MATCH_END && m.State != StateEnded {
+				log.Printf("[MATCH %s] SERVIDOR REMOTO CAIU! Erro ao enviar mensagem: %v", m.ID, err)
+
+				// Notifica o jogador local que o servidor do oponente caiu
+				m.sendToPlayer(localPlayerID, protocol.ServerMsg{
+					T:    protocol.SERVER_DOWN,
+					Code: "OPPONENT_SERVER_DOWN",
+					Msg:  "O servidor do oponente caiu. Você venceu por W.O.",
+				})
+
+				// Encerra a partida dando vitória ao jogador local
+				m.sendToPlayer(localPlayerID, protocol.ServerMsg{
+					T:      protocol.MATCH_END,
+					Result: protocol.VICTORY_BY_DISCONNECT,
+				})
+
+				// Sinaliza que a partida terminou
+				m.State = StateEnded
+				select {
+				case m.done <- true:
+				default:
+				}
+			}
+		}
 	}
 }
 
@@ -511,16 +638,44 @@ func (m *Match) forwardPlayIfNeeded(playerID, cardID string) {
 
 	// Determina o servidor do oponente usando o nome de serviço correto
 	var opponentServer string
+	var localPlayerID string
 	if distMatch.HostPlayer == playerID {
 		opponentServer = distMatch.GuestServer
+		localPlayerID = distMatch.HostPlayer
 	} else {
 		opponentServer = distMatch.HostServer
+		localPlayerID = distMatch.GuestPlayer
 	}
 
 	log.Printf("[MATCH %s] Retransmitindo jogada do jogador local %s (carta %s) para o servidor do oponente em %s",
 		m.ID, playerID, cardID, opponentServer)
 
-	s2s.ForwardAction(opponentServer, m.ID, playerID, cardID)
+	// Tenta retransmitir a jogada
+	err := s2s.ForwardAction(opponentServer, m.ID, playerID, cardID)
+	if err != nil {
+		// Falha na comunicação - servidor remoto caiu
+		log.Printf("[MATCH %s] SERVIDOR REMOTO CAIU! Erro ao retransmitir jogada: %v", m.ID, err)
+
+		// Notifica o jogador local que o servidor do oponente caiu
+		m.sendToPlayerSmart(localPlayerID, protocol.ServerMsg{
+			T:    protocol.SERVER_DOWN,
+			Code: "OPPONENT_SERVER_DOWN",
+			Msg:  "O servidor do oponente caiu. Você venceu por W.O.",
+		})
+
+		// Encerra a partida dando vitória ao jogador local
+		m.sendToPlayerSmart(localPlayerID, protocol.ServerMsg{
+			T:      protocol.MATCH_END,
+			Result: protocol.VICTORY_BY_DISCONNECT,
+		})
+
+		// Sinaliza que a partida terminou
+		m.State = StateEnded
+		select {
+		case m.done <- true:
+		default:
+		}
+	}
 }
 
 // scheduleAutoPlay agenda o auto-play se necessário

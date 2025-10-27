@@ -241,6 +241,26 @@ func (s *MatchmakingService) SetToken(t *token.Token) {
 	log.Printf("[MATCHMAKING] Token recebido e definido com %d cartas no pool", t.GetPoolSize())
 }
 
+// GetToken retorna o token atual (se este servidor possui o token)
+func (s *MatchmakingService) GetToken() *token.Token {
+	return s.currentToken
+}
+
+// RequestCardsFromToken retira cartas do token se este servidor o possuir
+func (s *MatchmakingService) RequestCardsFromToken(count int) ([]string, error) {
+	if s.currentToken == nil {
+		return nil, fmt.Errorf("este servidor não possui o token")
+	}
+
+	cards, err := s.currentToken.DrawCards(count)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao retirar cartas do token: %w", err)
+	}
+
+	log.Printf("[MATCHMAKING] Fornecidas %d cartas do token para reposição de mão", len(cards))
+	return cards, nil
+}
+
 // notifyPlayersOfMatch envia a mensagem MATCH_FOUND para os jogadores envolvidos.
 // O tipo do parâmetro 'match' foi corrigido para game.Match.
 func (s *MatchmakingService) notifyPlayersOfMatch(match *game.Match, p1, p2 *protocol.PlayerConn) {
