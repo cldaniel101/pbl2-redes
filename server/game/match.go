@@ -71,6 +71,35 @@ func NewMatch(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pu
 	return match
 }
 
+// NewMatchWithCards cria uma nova partida com cartas predefinidas do token
+func NewMatchWithCards(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pubsub.Broker, informer StateInformer, p1Cards, p2Cards []string) *Match {
+	match := &Match{
+		ID:       id,
+		P1:       p1,
+		P2:       p2,
+		HP:       [2]int{HPStart, HPStart},
+		Hands:    [2]Hand{},
+		Discard:  [2][]string{{}, {}},
+		Round:    1,
+		State:    StateAwaitingPlays,
+		Waiting:  make(map[string]string),
+		CardDB:   cardDB,
+		done:     make(chan bool, 1),
+		broker:   broker,
+		informer: informer,
+	}
+
+	// Define as mãos iniciais com as cartas do token
+	match.mu.Lock()
+	match.Hands[0] = p1Cards
+	match.Hands[1] = p2Cards
+	match.mu.Unlock()
+
+	log.Printf("[MATCH %s] Partida criada com cartas do token. P1: %v, P2: %v", id, p1Cards, p2Cards)
+
+	return match
+}
+
 // DealInitialHands distribui as mãos iniciais
 func (m *Match) DealInitialHands() {
 	m.mu.Lock()
@@ -119,14 +148,13 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 		} else {
 			return fmt.Errorf("índice de carta inválido")
 		}
-	} 
+	}
 
 	// Valida se a carta existe no CardDB
 	if !m.CardDB.ValidateCard(cardID) {
 		return fmt.Errorf("carta inválida")
 	}
 
-	
 	// Registra a jogada e remove a carta da mão
 	m.Waiting[playerID] = cardID
 
@@ -461,7 +489,7 @@ func (m *Match) sendToPlayerSmart(playerID string, msg protocol.ServerMsg) {
 
 	if isPlayerLocal {
 		m.sendToPlayer(playerID, msg)
-	} 
+	}
 }
 
 // forwardPlayIfNeeded verifica se uma jogada precisa ser retransmitida para um oponente
@@ -484,7 +512,7 @@ func (m *Match) forwardPlayIfNeeded(playerID, cardID string) {
 	// Determina o servidor do oponente usando o nome de serviço correto
 	var opponentServer string
 	if distMatch.HostPlayer == playerID {
-		opponentServer = distMatch.GuestServer		
+		opponentServer = distMatch.GuestServer
 	} else {
 		opponentServer = distMatch.HostServer
 	}
@@ -562,7 +590,6 @@ func max(a, b int) int {
 	}
 	return b
 }
-
 
 func (m *Match) DebugPrintNewRoundState() {
 	// (Esta função deve ser chamada de dentro de um método que já

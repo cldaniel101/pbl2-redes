@@ -159,6 +159,19 @@ func (sm *StateManager) CreateLocalMatch(p1, p2 *protocol.PlayerConn, broker *pu
 	return match
 }
 
+// CreateLocalMatchWithCards cria uma partida local com cartas predefinidas do token
+func (sm *StateManager) CreateLocalMatchWithCards(p1, p2 *protocol.PlayerConn, broker *pubsub.Broker, p1Cards, p2Cards []string) *game.Match {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	matchID := fmt.Sprintf("local_match_%d", time.Now().UnixNano())
+	match := game.NewMatchWithCards(matchID, p1, p2, sm.CardDB, broker, sm, p1Cards, p2Cards)
+	sm.ActiveMatches[matchID] = match
+
+	log.Printf("[STATE] Partida local %s criada entre %s e %s com cartas do token.", matchID, p1.ID, p2.ID)
+	return match
+}
+
 // AddPlayerToQueue adiciona um jogador à fila de matchmaking de forma segura.
 func (sm *StateManager) AddPlayerToQueue(player *protocol.PlayerConn) {
 	sm.mu.Lock()
@@ -226,9 +239,47 @@ func (sm *StateManager) ConfirmAndCreateDistributedMatch(matchID, guestPlayerID,
 	// for necessário um objeto Match no servidor convidado, mas pode ser útil).
 	hostPlayerConn := protocol.NewPlayerConn(hostPlayerID, nil)
 	match := game.NewMatch(matchID, hostPlayerConn, guestPlayer, sm.CardDB, broker, sm) // Broker é nil aqui
-	sm.ActiveMatches[matchID] = match	
+	sm.ActiveMatches[matchID] = match
 
 	log.Printf("[STATE] Partida distribuída %s confirmada para o jogador local %s.", matchID, guestPlayerID)
+
+	return guestPlayer, nil
+}
+
+// ConfirmAndCreateDistributedMatchWithCards é chamada pelo servidor convidado com cartas do token
+func (sm *StateManager) ConfirmAndCreateDistributedMatchWithCards(matchID, guestPlayerID, hostPlayerID, hostAddr, guestAddr string, broker *pubsub.Broker, guestCards []string) (*protocol.PlayerConn, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// 1. Verifica se o jogador convidado (que está neste servidor) ainda está na fila.
+	if len(sm.MatchmakingQueue) == 0 || sm.MatchmakingQueue[0].ID != guestPlayerID {
+		return nil, errors.New("jogador não está mais disponível na fila")
+	}
+
+	// 2. Jogador está disponível! Remove-o da fila.
+	guestPlayer := sm.MatchmakingQueue[0]
+	sm.MatchmakingQueue = sm.MatchmakingQueue[1:]
+
+	// 3. Regista os detalhes da partida distribuída.
+	hostIP := strings.Split(hostAddr, ":")[0]
+	distMatch := &DistributedMatch{
+		MatchID:     matchID,
+		HostServer:  "http://" + hostIP + ":8000",
+		GuestServer: guestAddr,
+		HostPlayer:  hostPlayerID,
+		GuestPlayer: guestPlayerID,
+	}
+	sm.DistributedMatches[matchID] = distMatch
+
+	// 4. Cria a partida com cartas predefinidas do token
+	// Nota: O host não está neste servidor, então suas cartas não são usadas aqui
+	// mas precisamos de um placeholder
+	hostPlayerConn := protocol.NewPlayerConn(hostPlayerID, nil)
+	hostCardsPlaceholder := make([]string, len(guestCards)) // Placeholder vazio
+	match := game.NewMatchWithCards(matchID, hostPlayerConn, guestPlayer, sm.CardDB, broker, sm, hostCardsPlaceholder, guestCards)
+	sm.ActiveMatches[matchID] = match
+
+	log.Printf("[STATE] Partida distribuída %s confirmada para o jogador local %s com cartas do token.", matchID, guestPlayerID)
 
 	return guestPlayer, nil
 }
@@ -304,6 +355,38 @@ func (sm *StateManager) CreateDistributedMatchAsHost(matchID string, hostPlayer 
 	sm.ActiveMatches[matchID] = match
 
 	log.Printf("[STATE] Partida distribuída %s criada pelo anfitrião %s.", matchID, hostPlayer.ID)
+
+	return match, nil
+}
+
+// CreateDistributedMatchAsHostWithCards cria uma partida distribuída como host com cartas do token
+func (sm *StateManager) CreateDistributedMatchAsHostWithCards(matchID string, hostPlayer *protocol.PlayerConn, guestPlayerID, hostAddr, guestAddr string, broker *pubsub.Broker, hostCards, guestCards []string) (*game.Match, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// 1. Verifica se o jogador anfitrião ainda está online.
+	if _, ok := sm.PlayersOnline[hostPlayer.ID]; !ok {
+		return nil, errors.New("jogador anfitrião desconectou-se antes da criação da partida")
+	}
+
+	// 2. Cria um jogador "placeholder" para o oponente remoto.
+	guestPlayerPlaceholder := protocol.NewPlayerConn(guestPlayerID, nil)
+
+	// 3. Regista os detalhes da partida distribuída.
+	distMatchInfo := &DistributedMatch{
+		MatchID:     matchID,
+		HostServer:  hostAddr,
+		GuestServer: guestAddr,
+		HostPlayer:  hostPlayer.ID,
+		GuestPlayer: guestPlayerID,
+	}
+	sm.DistributedMatches[matchID] = distMatchInfo
+
+	// 4. Cria a partida com cartas predefinidas do token
+	match := game.NewMatchWithCards(matchID, hostPlayer, guestPlayerPlaceholder, sm.CardDB, broker, sm, hostCards, guestCards)
+	sm.ActiveMatches[matchID] = match
+
+	log.Printf("[STATE] Partida distribuída %s criada pelo anfitrião %s com cartas do token.", matchID, hostPlayer.ID)
 
 	return match, nil
 }
