@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -11,9 +12,9 @@ import (
 	"pingpong/server/api"
 	"pingpong/server/matchmaking"
 	"pingpong/server/network"
-	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
 	"pingpong/server/state"
+	"pingpong/server/token"
 )
 
 func main() {
@@ -46,7 +47,27 @@ func main() {
 	broker := pubsub.NewBroker()
 
 	// Canal para o APIServer notificar o MatchmakingService quando o token chegar.
-	tokenAcquiredChan := make(chan protocol.TokenState, 1)
+	tokenAcquiredChan := make(chan bool, 1)
+
+	// 2.1. Inicialização do Token (apenas no primeiro servidor)
+	var initialToken *token.Token
+	if myIndex == 0 {
+		// O primeiro servidor cria e carrega o token com as cartas
+		initialToken = token.NewToken(thisServerAddress)
+
+		// Lê o arquivo cards.json
+		cardsData, err := ioutil.ReadFile("cards.json")
+		if err != nil {
+			log.Fatalf("[MAIN] Erro ao ler cards.json: %v", err)
+		}
+
+		// Carrega as cartas no token (100 cópias de cada carta)
+		if err := initialToken.LoadCardsFromJSON(cardsData, 100); err != nil {
+			log.Fatalf("[MAIN] Erro ao carregar cartas no token: %v", err)
+		}
+
+		log.Printf("[MAIN] Token inicial criado com %d cartas", initialToken.GetPoolSize())
+	}
 
 	// 3. Injeção de Dependências e Inicialização dos Serviços
 
@@ -58,6 +79,7 @@ func main() {
 		thisServerAddress,
 		allServers,
 		nextServerAddress,
+		initialToken,
 	)
 
 	// Servidor da API (para comunicação entre servidores)
@@ -66,6 +88,7 @@ func main() {
 		broker,
 		tokenAcquiredChan,
 		thisServerAddress,
+		matchmakingService,
 	)
 
 	// Servidor TCP (para comunicação com os clientes)
@@ -94,9 +117,7 @@ func main() {
 		log.Println("[MAIN] Eu sou o nó inicial. A criar e a passar o token pela primeira vez após 5 segundos...")
 		go func() {
 			time.Sleep(5 * time.Second) // Espera um pouco para os outros servidores estarem online
-			initialStock := 1000        // Estoque inicial de pacotes
-			log.Printf("[MAIN] A injetar estado inicial no token: %d pacotes", initialStock)
-			tokenAcquiredChan <- protocol.TokenState{PackStock: initialStock}
+			tokenAcquiredChan <- true
 		}()
 	}
 

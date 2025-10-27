@@ -2,13 +2,20 @@ package api
 
 import (
 	"encoding/json"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
 	"pingpong/server/state"
+	"pingpong/server/token"
 	"strings"
 )
+
+// TokenReceiver define a interface para receber o token
+type TokenReceiver interface {
+	SetToken(t *token.Token)
+}
 
 // APIServer lida com as requisições HTTP da API inter-servidores.
 type APIServer struct {
@@ -17,16 +24,18 @@ type APIServer struct {
 	serverAddr   string
 	// O canal de token é injetado para que o handler possa notificar
 	// o serviço de matchmaking quando o token for recebido.
-	tokenAcquiredChan chan<- protocol.TokenState
+	tokenAcquiredChan chan<- bool
+	tokenReceiver     TokenReceiver
 }
 
 // NewServer cria uma nova instância do servidor da API.
-func NewServer(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan<- protocol.TokenState, serverAddr string) *APIServer {
+func NewServer(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan<- bool, serverAddr string, tokenReceiver TokenReceiver) *APIServer {
 	return &APIServer{
 		stateManager:      sm,
 		broker:            broker,
 		tokenAcquiredChan: tokenChan,
 		serverAddr:        serverAddr,
+		tokenReceiver:     tokenReceiver,
 	}
 }
 
@@ -67,9 +76,10 @@ func (s *APIServer) handleFindOpponent(w http.ResponseWriter, r *http.Request) {
 // handleRequestMatch processa o pedido final para criar uma partida distribuída.
 func (s *APIServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		MatchID       string `json:"matchId"`
-		HostPlayerID  string `json:"hostPlayerId"`
-		GuestPlayerID string `json:"guestPlayerId"`
+		MatchID       string   `json:"matchId"`
+		HostPlayerID  string   `json:"hostPlayerId"`
+		GuestPlayerID string   `json:"guestPlayerId"`
+		GuestCards    []string `json:"guestCards"` // Cartas para o jogador convidado
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Pedido inválido", http.StatusBadRequest)
@@ -77,13 +87,15 @@ func (s *APIServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Delega a lógica de confirmação e criação da partida para o StateManager.
-	guestPlayer, err := s.stateManager.ConfirmAndCreateDistributedMatch(
+	// Agora passa também as cartas do jogador convidado
+	guestPlayer, err := s.stateManager.ConfirmAndCreateDistributedMatchWithCards(
 		req.MatchID,
 		req.GuestPlayerID,
 		req.HostPlayerID,
 		r.RemoteAddr, // O endereço do servidor anfitrião
 		s.serverAddr, // O endereço deste servidor (convidado)
 		s.broker,
+		req.GuestCards,
 	)
 
 	if err != nil {
@@ -92,7 +104,8 @@ func (s *APIServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[API] Partida distribuída %s aceite para o jogador local %s.", req.MatchID, req.GuestPlayerID)
+	log.Printf("[API] Partida distribuída %s aceite para o jogador local %s com %d cartas.",
+		req.MatchID, req.GuestPlayerID, len(req.GuestCards))
 
 	// Notifica o jogador local (convidado) de que a partida foi encontrada.
 	s.sendToPlayer(guestPlayer.ID, protocol.ServerMsg{
@@ -104,7 +117,7 @@ func (s *APIServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
 	// --- INÍCIO DA CORREÇÃO ---
 	// Envia o estado inicial (Rodada 1) para o jogador convidado (local).
 	// Isto é crucial para que ele receba a sua mão inicial.
-	// (Usamos FindMatchByID porque ConfirmAndCreateDistributedMatch já o criou)
+	// (Usamos FindMatchByID porque ConfirmAndCreateDistributedMatchWithCards já o criou)
 	if match := s.stateManager.FindMatchByID(req.MatchID); match != nil {
 		match.BroadcastState()
 	}
@@ -113,29 +126,50 @@ func (s *APIServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleReceiveToken recebe o token de outro servidor e notifica o serviço de matchmaking.
+// handleReceiveToken recebe o token com cartas de outro servidor e notifica o serviço de matchmaking.
 func (s *APIServer) handleReceiveToken(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+	// Lê o corpo da requisição
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("[API] Erro ao ler corpo da requisição do token: %v", err)
+		http.Error(w, "Erro ao ler token", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	// Se o corpo estiver vazio, é o token inicial sem cartas
+	if len(body) == 0 {
+		log.Printf("[API] Recebi token vazio (bootstrap inicial).")
+		select {
+		case s.tokenAcquiredChan <- true:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	var tokenState protocol.TokenState
-	if err := json.NewDecoder(r.Body).Decode(&tokenState); err != nil {
-		log.Printf("[API] Erro ao decodificar o estado do token: %v", err)
-		http.Error(w, "Corpo do pedido inválido", http.StatusBadRequest)
+	// Deserializa o token
+	receivedToken, err := token.FromJSON(body)
+	if err != nil {
+		log.Printf("[API] Erro ao deserializar token: %v", err)
+		http.Error(w, "Token inválido", http.StatusBadRequest)
 		return
 	}
 
-	log.Printf("[API] Recebi o token do servidor anterior com estado: %+v", tokenState)
+	log.Printf("[API] Recebi o token com %d cartas no pool.", receivedToken.GetPoolSize())
 
+	// Passa o token para o serviço de matchmaking
+	if s.tokenReceiver != nil {
+		s.tokenReceiver.SetToken(receivedToken)
+	}
+
+	// Notifica o matchmaking que pode começar a sua verificação
 	select {
-	case s.tokenAcquiredChan <- tokenState:
-		// Notifica o matchmaking que pode começar a sua verificação.
+	case s.tokenAcquiredChan <- true:
 	default:
-		// Evita bloquear se o serviço de matchmaking não estiver pronto para receber.
-		log.Println("[API] Aviso: canal do token bloqueado, não foi possível enviar o estado.")
+		// Evita bloquear se o serviço de matchmaking não estiver pronto para receber
 	}
+
 	w.WriteHeader(http.StatusOK)
 }
 

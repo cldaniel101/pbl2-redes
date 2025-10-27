@@ -71,6 +71,35 @@ func NewMatch(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pu
 	return match
 }
 
+// NewMatchWithCards cria uma nova partida com cartas predefinidas do token
+func NewMatchWithCards(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pubsub.Broker, informer StateInformer, p1Cards, p2Cards []string) *Match {
+	match := &Match{
+		ID:       id,
+		P1:       p1,
+		P2:       p2,
+		HP:       [2]int{HPStart, HPStart},
+		Hands:    [2]Hand{},
+		Discard:  [2][]string{{}, {}},
+		Round:    1,
+		State:    StateAwaitingPlays,
+		Waiting:  make(map[string]string),
+		CardDB:   cardDB,
+		done:     make(chan bool, 1),
+		broker:   broker,
+		informer: informer,
+	}
+
+	// Define as mãos iniciais com as cartas do token
+	match.mu.Lock()
+	match.Hands[0] = p1Cards
+	match.Hands[1] = p2Cards
+	match.mu.Unlock()
+
+	log.Printf("[MATCH %s] Partida criada com cartas do token. P1: %v, P2: %v", id, p1Cards, p2Cards)
+
+	return match
+}
+
 // DealInitialHands distribui as mãos iniciais
 func (m *Match) DealInitialHands() {
 	m.mu.Lock()
@@ -126,16 +155,12 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 		return fmt.Errorf("carta inválida")
 	}
 
-	// Registra a jogada
+	// Registra a jogada e remove a carta da mão
 	m.Waiting[playerID] = cardID
 
-	// Se a partida for distribuída, retransmite a jogada para o outro servidor.
-	if err := m.forwardPlayIfNeeded(playerID, cardID); err != nil {
-		// A comunicação S2S falhou. Encerra a partida.
-		log.Printf("[MATCH %s] Falha S2S ao retransmitir jogada de %s. Encerrando partida. Erro: %v", m.ID, playerID, err)
-		m.endDueToError(playerID, err)
-		return nil // Retorna nil para o handler, pois a partida foi tratada (encerrada).
-	}
+	// Se a partida for distribuída, retransmite a jogada para o outro servidor
+	// ANTES de registrar a jogada localmente.
+	m.forwardPlayIfNeeded(playerID, cardID)
 
 	// Verifica se ambos jogaram
 	if len(m.Waiting) == 2 {
@@ -192,7 +217,7 @@ func (m *Match) resolveRound() {
 
 	// Limpa as jogadas
 	m.Waiting = make(map[string]string)
-	log.Printf("[MATCH %s] Jogadas limpas para próxima rodada. Estado: %v", m.ID, m.Waiting)
+	fmt.Println("\n\n\n\n" + fmt.Sprintf("%v", m.Waiting) + "\n\n\n\n")
 	m.Round++
 
 	// Verifica fim do jogo
@@ -464,21 +489,27 @@ func (m *Match) sendToPlayerSmart(playerID string, msg protocol.ServerMsg) {
 
 	if isPlayerLocal {
 		m.sendToPlayer(playerID, msg)
-	} 
+	}
 }
 
-// forwardPlayIfNeeded retransmite a jogada e retorna um erro em caso de falha.
-func (m *Match) forwardPlayIfNeeded(playerID, cardID string) error {
+// forwardPlayIfNeeded verifica se uma jogada precisa ser retransmitida para um oponente
+// em outro servidor e, se for o caso, executa a retransmissão.
+func (m *Match) forwardPlayIfNeeded(playerID, cardID string) {
+	// Obter informações da partida distribuída
 	distMatch, isDistributed := m.informer.GetDistributedMatchInfo(m.ID)
 	if !isDistributed {
-		return nil // Não é um erro, apenas não faz nada.
+		return // Não faz nada em partidas locais
 	}
 
+	// Verifica se o jogador que fez a jogada está neste servidor.
+	// Apenas retransmitimos jogadas de jogadores locais.
 	isPlayerLocal := m.informer.IsPlayerOnline(playerID)
 	if !isPlayerLocal {
-		return nil
+		log.Printf("[MATCH %s] Não retransmitindo jogada de %s pois não é local", m.ID, playerID)
+		return
 	}
 
+	// Determina o servidor do oponente usando o nome de serviço correto
 	var opponentServer string
 	if distMatch.HostPlayer == playerID {
 		opponentServer = distMatch.GuestServer
@@ -486,10 +517,10 @@ func (m *Match) forwardPlayIfNeeded(playerID, cardID string) error {
 		opponentServer = distMatch.HostServer
 	}
 
-	log.Printf("[MATCH %s] Retransmitindo jogada do jogador local %s para %s", m.ID, playerID, opponentServer)
+	log.Printf("[MATCH %s] Retransmitindo jogada do jogador local %s (carta %s) para o servidor do oponente em %s",
+		m.ID, playerID, cardID, opponentServer)
 
-	// Chama a nova função s2s que retorna erro
-	return s2s.ForwardAction(opponentServer, m.ID, playerID, cardID)
+	s2s.ForwardAction(opponentServer, m.ID, playerID, cardID)
 }
 
 // scheduleAutoPlay agenda o auto-play se necessário
@@ -558,29 +589,6 @@ func max(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// endDueToError encerra a partida devido a uma falha de comunicação S2S.
-func (m *Match) endDueToError(localPlayerID string, reason error) {
-	// Garante que o encerramento só aconteça uma vez.
-	if m.State == StateEnded {
-		return
-	}
-	m.State = StateEnded
-
-	// Notifica o jogador local que ele venceu por desconexão do oponente.
-	log.Printf("[MATCH %s] Notificando jogador local %s sobre vitória por desconexão do oponente.", m.ID, localPlayerID)
-	m.sendToPlayerSmart(localPlayerID, protocol.ServerMsg{
-		T:      protocol.MATCH_END,
-		Result: protocol.VICTORY_BY_DISCONNECT,
-		Msg:    fmt.Sprintf("O oponente desconectou ou houve uma falha de rede: %v", reason),
-	})
-
-	// Sinaliza que a partida terminou para que seja limpa do StateManager.
-	select {
-	case m.done <- true:
-	default:
-	}
 }
 
 func (m *Match) DebugPrintNewRoundState() {
