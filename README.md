@@ -64,12 +64,12 @@ docker run --rm -it --network pbl2-redes_game-net \
 
 # Conectar cliente ao servidor 2
 docker run --rm -it --network pbl2-redes_game-net \
-  -e SERVER_ADDR=server-2:9000 \
+  -e SERVER_ADDR=server-2:9101 \
   pingpong-client:latest
 
 # Conectar cliente ao servidor 3
 docker run --rm -it --network pbl2-redes_game-net \
-  -e SERVER_ADDR=server-3:9000 \
+  -e SERVER_ADDR=server-3:9002 \
   pingpong-client:latest
 ```
 
