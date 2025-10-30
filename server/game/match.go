@@ -71,6 +71,41 @@ func NewMatch(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pu
 	return match
 }
 
+// NewMatchWithCards cria uma nova partida com cartas predefinidas
+func NewMatchWithCards(id string, p1, p2 *protocol.PlayerConn, cardDB *CardDB, broker *pubsub.Broker, informer StateInformer, p1Cards, p2Cards []string) *Match {
+    match := &Match{
+        ID:       id,
+        P1:       p1,
+        P2:       p2,
+        HP:       [2]int{HPStart, HPStart},
+        Hands:    [2]Hand{},
+        Discard:  [2][]string{{}, {}},
+        Round:    1,
+        State:    StateAwaitingPlays,
+        Waiting:  make(map[string]string),
+        CardDB:   cardDB,
+        done:     make(chan bool, 1),
+        broker:   broker,
+        informer: informer,
+    }
+
+    match.mu.Lock()
+    match.Hands[0] = append([]string{}, p1Cards...)
+    match.Hands[1] = append([]string{}, p2Cards...)
+    match.mu.Unlock()
+
+    log.Printf("[MATCH %s] Partida criada com cartas predefinidas. P1: %v, P2: %v", id, p1Cards, p2Cards)
+    return match
+}
+
+// OverrideInitialHands substitui as m3os iniciais (uso controlado pelo matchmaking)
+func (m *Match) OverrideInitialHands(p1Cards, p2Cards []string) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    m.Hands[0] = append([]string{}, p1Cards...)
+    m.Hands[1] = append([]string{}, p2Cards...)
+}
+
 // DealInitialHands distribui as mãos iniciais
 func (m *Match) DealInitialHands() {
 	m.mu.Lock()

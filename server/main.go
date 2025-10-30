@@ -13,6 +13,7 @@ import (
 	"pingpong/server/network"
 	"pingpong/server/pubsub"
 	"pingpong/server/state"
+    "pingpong/server/token"
 )
 
 func main() {
@@ -67,6 +68,9 @@ func main() {
 		thisServerAddress,
 	)
 
+    // Entrega o receptor de token (matchmaking) ao servidor da API
+    apiServer.SetTokenReceiver(matchmakingService)
+
 	// Servidor TCP (para comunicação com os clientes)
 	tcpServer := network.NewTCPServer(
 		tcpAddr,
@@ -89,13 +93,16 @@ func main() {
 
 	// 5. Lógica de Arranque do Token
 	// O primeiro servidor na lista é responsável por criar e iniciar o token.
-	if myIndex == 0 {
-		log.Println("[MAIN] Eu sou o nó inicial. A criar e a passar o token pela primeira vez após 5 segundos...")
-		go func() {
-			time.Sleep(5 * time.Second) // Espera um pouco para os outros servidores estarem online
-			tokenAcquiredChan <- true
-		}()
-	}
+    if myIndex == 0 {
+        log.Println("[MAIN] Eu sou o nó inicial. A criar o token e iniciar a circulação após 5 segundos...")
+        go func() {
+            time.Sleep(5 * time.Second)
+            // Cria um token inicial vazio (será reabastecido on-demand)
+            initialToken := token.New(thisServerAddress, []string{})
+            matchmakingService.SetToken(initialToken)
+            tokenAcquiredChan <- true
+        }()
+    }
 
 	// 6. Iniciar o Servidor TCP (bloqueia a goroutine principal)
 	// Este deve ser o último passo, pois Listen() é uma operação de bloqueio.

@@ -8,6 +8,8 @@ import (
 	"pingpong/server/pubsub"
 	"pingpong/server/state"
 	"strings"
+    "io/ioutil"
+    "pingpong/server/token"
 )
 
 // APIServer lida com as requisições HTTP da API inter-servidores.
@@ -18,6 +20,7 @@ type APIServer struct {
 	// O canal de token é injetado para que o handler possa notificar
 	// o serviço de matchmaking quando o token for recebido.
 	tokenAcquiredChan chan<- bool
+    tokenReceiver     interface{ SetToken(*token.Token) }
 }
 
 // NewServer cria uma nova instância do servidor da API.
@@ -28,6 +31,11 @@ func NewServer(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan<- b
 		tokenAcquiredChan: tokenChan,
 		serverAddr:        serverAddr,
 	}
+}
+
+// SetTokenReceiver define o destino para entregar o token recebido
+func (s *APIServer) SetTokenReceiver(receiver interface{ SetToken(*token.Token) }) {
+    s.tokenReceiver = receiver
 }
 
 // Router configura e retorna um novo router HTTP com todos os endpoints da API.
@@ -115,14 +123,25 @@ func (s *APIServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
 
 // handleReceiveToken recebe o token de outro servidor e notifica o serviço de matchmaking.
 func (s *APIServer) handleReceiveToken(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[API] Recebi o token do servidor anterior.")
-	select {
-	case s.tokenAcquiredChan <- true:
-		// Notifica o matchmaking que pode começar a sua verificação.
-	default:
-		// Evita bloquear se o serviço de matchmaking não estiver pronto para receber.
-	}
-	w.WriteHeader(http.StatusOK)
+    body, err := ioutil.ReadAll(r.Body)
+    if err != nil {
+        http.Error(w, "Falha ao ler corpo", http.StatusBadRequest)
+        return
+    }
+    tok, err := token.FromJSON(body)
+    if err != nil {
+        http.Error(w, "Token inválido", http.StatusBadRequest)
+        return
+    }
+    log.Printf("[API] Recebi o token com %d cartas no pool.", len(tok.CardPool))
+    if s.tokenReceiver != nil {
+        s.tokenReceiver.SetToken(tok)
+    }
+    select {
+    case s.tokenAcquiredChan <- true:
+    default:
+    }
+    w.WriteHeader(http.StatusOK)
 }
 
 // handleMatchAction recebe uma ação de um jogador remoto (ex: jogar uma carta)
