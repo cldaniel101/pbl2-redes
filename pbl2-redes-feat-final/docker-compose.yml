@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  # --- Cluster de Servidores do Jogo ---
+  server-1:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: pingpong-server:latest
+    container_name: pbl_server_1
+    hostname: server-1
+    networks:
+      - game-net
+    ports:
+      - "9000:9000" # Porta TCP para clientes
+      - "8000:8000" # Porta HTTP para API inter-servidores
+    environment:
+      - LISTEN_ADDR=:9000
+      - API_ADDR=:8000
+      - ALL_SERVERS=http://server-1:8000,http://server-2:8000,http://server-3:8000
+
+  server-2:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: pingpong-server:latest
+    container_name: pbl_server_2
+    hostname: server-2
+    networks:
+      - game-net
+    ports:
+      - "9001:9000"
+      - "8101:8000"
+    environment:
+      - LISTEN_ADDR=:9000
+      - API_ADDR=:8000
+      - ALL_SERVERS=http://server-1:8000,http://server-2:8000,http://server-3:8000
+
+  server-3:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: pingpong-server:latest
+    container_name: pbl_server_3
+    hostname: server-3
+    networks:
+      - game-net
+    ports:
+      - "9002:9000"
+      - "8002:8000"
+    environment:
+      - LISTEN_ADDR=:9000
+      - API_ADDR=:8000
+      - ALL_SERVERS=http://server-1:8000,http://server-2:8000,http://server-3:8000
+
+  # --- Serviço de Cliente para Testes ---
+  # Pode escalar este serviço para ter múltiplos clientes
+  client:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    image: pingpong-client:latest
+    stdin_open: true
+    tty: true
+    networks:
+      - game-net
+    environment:
+      # O cliente conecta-se ao server-1 através da rede interna do Docker
+      SERVER_ADDR: "server-1:9000" 
+      PING_INTERVAL_MS: "2000"
+    depends_on:
+      # O cliente só inicia depois que o server-1 estiver pronto.
+      # Removido o healthcheck para simplificar, mas pode ser adicionado de volta.
+      - server-1
+
+# Define a rede personalizada que permite a comunicação entre os serviços
+networks:
+  game-net:
+    driver: bridge

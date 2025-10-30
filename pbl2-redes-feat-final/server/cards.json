@@ -1,0 +1,65 @@
+[
+  {
+    "id": "c_001",
+    "name": "Fire Dragon",
+    "element": "FIRE",
+    "atk": 8,
+    "def": 5
+  },
+  {
+    "id": "c_002",
+    "name": "Ice Mage",
+    "element": "WATER",
+    "atk": 6,
+    "def": 6
+  },
+  {
+    "id": "c_003",
+    "name": "Vine Beast",
+    "element": "PLANT",
+    "atk": 7,
+    "def": 4
+  },
+  {
+    "id": "c_004",
+    "name": "Flame Warrior",
+    "element": "FIRE",
+    "atk": 6,
+    "def": 7
+  },
+  {
+    "id": "c_005",
+    "name": "Water Serpent",
+    "element": "WATER",
+    "atk": 9,
+    "def": 3
+  },
+  {
+    "id": "c_006",
+    "name": "Forest Guardian",
+    "element": "PLANT",
+    "atk": 5,
+    "def": 8
+  },
+  {
+    "id": "c_007",
+    "name": "Inferno Titan",
+    "element": "FIRE",
+    "atk": 10,
+    "def": 2
+  },
+  {
+    "id": "c_008",
+    "name": "Frost Giant",
+    "element": "WATER",
+    "atk": 7,
+    "def": 7
+  },
+  {
+    "id": "c_009",
+    "name": "Nature Spirit",
+    "element": "PLANT",
+    "atk": 4,
+    "def": 9
+  }
+]
