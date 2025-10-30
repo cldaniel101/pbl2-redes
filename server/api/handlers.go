@@ -45,7 +45,7 @@ func (s *APIServer) Router() http.Handler {
 	mux.HandleFunc("/api/find-opponent", s.handleFindOpponent)
 	mux.HandleFunc("/api/request-match", s.handleRequestMatch)
 	mux.HandleFunc("/api/receive-token", s.handleReceiveToken)
-	mux.HandleFunc("/matches/", s.handleMatchAction) // Novo endpoint para ações da partida
+	mux.HandleFunc("/matches/", s.handleMatchAction) 
 	mux.HandleFunc("/api/forward/message", s.handleForwardMessage)
 	return mux
 }
@@ -114,14 +114,12 @@ func (s *APIServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
 		OpponentID: req.HostPlayerID,
 	})
 
-	// --- INÍCIO DA CORREÇÃO ---
 	// Envia o estado inicial (Rodada 1) para o jogador convidado (local).
 	// Isto é crucial para que ele receba a sua mão inicial.
 	// (Usamos FindMatchByID porque ConfirmAndCreateDistributedMatchWithCards já o criou)
 	if match := s.stateManager.FindMatchByID(req.MatchID); match != nil {
 		match.BroadcastState()
 	}
-	// --- FIM DA CORREÇÃO ---
 
 	w.WriteHeader(http.StatusOK)
 }

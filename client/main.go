@@ -229,7 +229,6 @@ func handleServerMessage(msg *ServerMsg) {
 		inMatch = true
 
 	case "STATE":
-		// CORREÇÃO: A atribuição a 'gameState' foi removida.
 		currentHand = msg.You.Hand
 		fmt.Printf("\n=== RODADA %d ===\n", msg.Round)
 		fmt.Printf("💚 Seu HP: %d | ❤️ HP do Oponente: %d\n", msg.You.HP, msg.Opponent.HP)

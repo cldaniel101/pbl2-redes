@@ -7,8 +7,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	// Importa os novos pacotes modulares
 	"pingpong/server/api"
 	"pingpong/server/matchmaking"
 	"pingpong/server/network"

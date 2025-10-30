@@ -242,7 +242,6 @@ func (s *MatchmakingService) SetToken(t *token.Token) {
 }
 
 // notifyPlayersOfMatch envia a mensagem MATCH_FOUND para os jogadores envolvidos.
-// O tipo do parâmetro 'match' foi corrigido para game.Match.
 func (s *MatchmakingService) notifyPlayersOfMatch(match *game.Match, p1, p2 *protocol.PlayerConn) {
 	s.broker.Publish("player."+p1.ID, protocol.ServerMsg{
 		T:          protocol.MATCH_FOUND,
@@ -258,7 +257,6 @@ func (s *MatchmakingService) notifyPlayersOfMatch(match *game.Match, p1, p2 *pro
 }
 
 // monitorMatch aguarda o fim de uma partida para a remover do estado.
-// O tipo do parâmetro 'match' foi corrigido para game.Match.
 func (s *MatchmakingService) monitorMatch(match *game.Match) {
 	<-match.Done()
 	s.stateManager.RemoveMatch(match.ID)

@@ -29,7 +29,7 @@ services:
     networks:
       - game-net
     ports:
-      - "9101:9000"
+      - "9001:9000"
       - "8101:8000"
     environment:
       - LISTEN_ADDR=:9000
