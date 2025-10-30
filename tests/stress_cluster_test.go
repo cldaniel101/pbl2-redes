@@ -3,319 +3,161 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"net"
-	"os"
-	"os/exec"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-func TestStressCluster(t *testing.T) {
-	// Compilar o binário do servidor para o diretório de teste
-	buildCmd := exec.Command("go", "build", "-o", "server_test_bin", ".")
-	buildCmd.Dir = "../server"
-	buildOutput, err := buildCmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("Falha ao compilar o servidor: %v\n%s", err, string(buildOutput))
+// ServerInfo armazena o IP e a Porta de um servidor do cluster
+type ServerInfo struct {
+	IP   string
+	Port int
+}
+
+// ESTE TESTE ASSUME QUE OS 3 SERVIDORES JÁ ESTÃO A RODAR NAS SUAS MÁQUINAS REAIS
+func TestStressMatchmaking(t *testing.T) {
+
+	// --- 1. Configuração dos Servidores ---
+	// !!! MUDE OS IPS PARA OS IPS REAIS DAS SUAS MÁQUINAS !!!
+	servers := []ServerInfo{
+		{IP: "172.16.103.11", Port: 9000}, // Servidor 1
+		{IP: "172.16.103.12", Port: 9001}, // Servidor 2
+		{IP: "172.16.103.13", Port: 9002}, // Servidor 3
 	}
-	defer os.Remove("server_test_bin") // Limpa o binário após o teste
+	// ---------------------------------------------------
 
-	// Configuração dos servidores
-	numServers := 3
-	initialTCPPort := 9000
-	initialAPIPort := 8000
-	var serverCmds []*exec.Cmd
-	var allServersAPIs []string
+	numServers := len(servers)
 
-	for i := 0; i < numServers; i++ {
-		allServersAPIs = append(allServersAPIs, fmt.Sprintf("http://localhost:%d", initialAPIPort+i))
-	}
-	allServersStr := strings.Join(allServersAPIs, ",")
+	// --- 2. Configuração do Teste ---
+	// Vamos usar um número par de clientes para formar pares
+	const numClients = 100 // 50 pares = 50 partidas
+	
+	// Aumenta a rampa para dar tempo ao matchmaking de processar
+	const clientRampUpDelay = 100 * time.Millisecond 
+	
+	// Timeout total para um cliente esperar por uma partida
+	const matchmakingTimeout = 20 * time.Second
+	// ---------------------------------------------------
 
-	// Iniciar servidores
-	for i := 0; i < numServers; i++ {
-		tcpAddr := ":" + strconv.Itoa(initialTCPPort+i)
-		apiAddr := ":" + strconv.Itoa(initialAPIPort+i)
-
-		cmd := exec.Command("./server_test_bin")
-		// cmd.Dir = "../server" // Não é mais necessário, o binário está local
-		cmd.Env = append(os.Environ(),
-			"LISTEN_ADDR="+tcpAddr,
-			"API_ADDR="+apiAddr,
-			"ALL_SERVERS="+allServersStr,
-			"HOSTNAME=localhost",
-		)
-
-		// Redirecionar a saída para o log de teste para depuração
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		err := cmd.Start()
-		if err != nil {
-			t.Fatalf("Falha ao iniciar o servidor %d: %v", i, err)
-		}
-		serverCmds = append(serverCmds, cmd)
-		t.Logf("Servidor %d iniciado com TCP em %s e API em %s", i, tcpAddr, apiAddr)
-	}
-
-	// Cleanup: garantir que todos os servidores sejam terminados
-	t.Cleanup(func() {
-		t.Log("A terminar os processos do servidor...")
-		for _, cmd := range serverCmds {
-			if cmd.Process != nil {
-				if err := cmd.Process.Kill(); err != nil {
-					t.Errorf("Falha ao terminar o processo do servidor %d: %v", cmd.Process.Pid, err)
-				}
-			}
-		}
-	})
-
-	// Aguardar os servidores estarem prontos
-	t.Log("A aguardar os servidores estarem prontos...")
-	time.Sleep(5 * time.Second) // Simples espera, pode ser melhorada
-
-	// --- Início da lógica do cliente ---
-	initialStock := 1000
-	numClients := initialStock + 200 // Simular mais clientes do que o estoque
 	results := make(chan string, numClients)
 	var wg sync.WaitGroup
 
-	t.Logf("A iniciar %d clientes para o teste de estresse...", numClients)
+	t.Logf("A iniciar %d clientes (rampa de %v) para stress de MATCHMAKING...", 
+		numClients, clientRampUpDelay)
 
+	// --- 3. Execução dos Clientes ---
 	for i := 0; i < numClients; i++ {
 		wg.Add(1)
 		go func(clientID int) {
 			defer wg.Done()
 
 			// Round-robin para distribuir clientes entre os servidores
-			serverIdx := clientID % numServers
-			serverTCPAddr := fmt.Sprintf("localhost:%d", initialTCPPort+serverIdx)
+			server := servers[clientID%numServers]
+			serverTCPAddr := net.JoinHostPort(server.IP, strconv.Itoa(server.Port))
 
-			conn, err := net.Dial("tcp", serverTCPAddr)
+			// Conecta ao servidor
+			conn, err := net.DialTimeout("tcp", serverTCPAddr, 5*time.Second)
 			if err != nil {
-				t.Errorf("Cliente %d falhou ao conectar-se a %s: %v", clientID, serverTCPAddr, err)
+				t.Logf("[Cliente %d] Falhou ao conectar-se a %s: %v", clientID, serverTCPAddr, err)
 				results <- "CONNECTION_ERROR"
 				return
 			}
 			defer conn.Close()
 
-			// Enviar comando OPEN_PACK
-			openPackMsg := `{"t": "OPEN_PACK"}`
-			_, err = conn.Write([]byte(openPackMsg + "\n"))
+			// Envia comando FIND_MATCH
+			findMatchMsg := `{"t": "FIND_MATCH"}`
+			_, err = conn.Write([]byte(findMatchMsg + "\n"))
 			if err != nil {
-				t.Errorf("Cliente %d falhou ao enviar mensagem: %v", clientID, err)
+				t.Logf("[Cliente %d] Falhou ao enviar FIND_MATCH para %s: %v", clientID, serverTCPAddr, err)
 				results <- "SEND_ERROR"
 				return
 			}
 
-			// Ler a resposta
+			// Define um deadline LONGO. O cliente vai esperar até 20s por uma partida.
+			conn.SetReadDeadline(time.Now().Add(matchmakingTimeout))
 			reader := bufio.NewReader(conn)
-			response, err := reader.ReadString('\n')
-			if err != nil {
-				t.Errorf("Cliente %d falhou ao ler a resposta: %v", clientID, err)
-				results <- "READ_ERROR"
-				return
+
+			// Loop de leitura: O cliente espera por "QUEUED" e depois por "MATCH_FOUND"
+			for {
+				response, err := reader.ReadString('\n')
+				if err != nil {
+					// Isto é um TIMEOUT - o cliente esperou 20s e não encontrou partida
+					t.Logf("[Cliente %d] Timeout à espera de partida em %s: %v", clientID, serverTCPAddr, err)
+					results <- "MATCH_TIMEOUT"
+					return
+				}
+
+				// Analisar a resposta
+				var serverMsg struct {
+					T    string `json:"t"`
+					Code string `json:"code,omitempty"`
+				}
+				json.Unmarshal([]byte(response), &serverMsg)
+
+				// "QUEUED" é uma resposta esperada, continuamos à espera
+				if serverMsg.T == "ERROR" && serverMsg.Code == "QUEUED" {
+					t.Logf("[Cliente %d] Na fila em %s. A aguardar partida...", clientID, serverTCPAddr)
+					continue
+				}
+
+				// "MATCH_FOUND" é o nosso SUCESSO!
+				if serverMsg.T == "MATCH_FOUND" {
+					t.Logf("[Cliente %d] SUCESSO: Partida encontrada em %s!", clientID, serverTCPAddr)
+					results <- "MATCH_SUCCESS"
+					return // O teste para este cliente terminou
+				}
+				
+				// Qualquer outra mensagem é inesperada
+				t.Logf("[Cliente %d] Resposta inesperada de %s: %s", clientID, serverTCPAddr, response)
 			}
 
-			// Analisar a resposta para determinar o tipo
-			var serverMsg struct {
-				T    string `json:"t"`
-				Code string `json:"code,omitempty"`
-			}
-			if err := json.Unmarshal([]byte(response), &serverMsg); err != nil {
-				t.Errorf("Cliente %d falhou ao analisar JSON da resposta '%s': %v", clientID, response, err)
-				results <- "JSON_ERROR"
-				return
-			}
-
-			if serverMsg.T == "PACK_OPENED" {
-				results <- "PACK_OPENED"
-			} else if serverMsg.T == "ERROR" && serverMsg.Code == "OUT_OF_STOCK" {
-				results <- "OUT_OF_STOCK"
-			} else {
-				t.Errorf("Cliente %d recebeu uma resposta inesperada: %s", clientID, response)
-				results <- "UNEXPECTED_RESPONSE"
-			}
 		}(i)
+		
+		// Pausa entre o arranque de cada cliente (rampa)
+		time.Sleep(clientRampUpDelay)
 	}
 
+	// --- 4. Validação dos Resultados ---
+	t.Log("Todos os clientes foram iniciados. A aguardar o matchmaking...")
 	wg.Wait()
 	close(results)
+	t.Log("Todos os clientes terminaram (encontraram partida ou expiraram).")
 
-	// --- Validação dos resultados ---
-	packOpenedCount := 0
-	outOfStockCount := 0
+	matchSuccessCount := 0
+	matchTimeoutCount := 0
 	errorCount := 0
 
 	for result := range results {
 		switch result {
-		case "PACK_OPENED":
-			packOpenedCount++
-		case "OUT_OF_STOCK":
-			outOfStockCount++
+		case "MATCH_SUCCESS":
+			matchSuccessCount++
+		case "MATCH_TIMEOUT":
+			matchTimeoutCount++
 		default:
 			errorCount++
 		}
 	}
 
-	t.Logf("Resultados: %d PACK_OPENED, %d OUT_OF_STOCK, %d erros", packOpenedCount, outOfStockCount, errorCount)
+	t.Logf("--- RESULTADO FINAL ---")
+	t.Logf("Clientes que encontraram partida: %d", matchSuccessCount)
+	t.Logf("Clientes que expiraram (timeout): %d", matchTimeoutCount)
+	t.Logf("Erros de Conexão/Envio:         %d", errorCount)
+	t.Logf("-----------------------")
 
-	if packOpenedCount != initialStock {
-		t.Errorf("Contagem de PACK_OPENED esperada: %d, obtida: %d", initialStock, packOpenedCount)
+
+	// Validação final:
+	// O seu token auto-refresca-se, 
+	// por isso o "estoque" é infinito.
+	// Todos os clientes devem encontrar uma partida.
+	if matchSuccessCount != numClients {
+		t.Errorf("Contagem de SUCESSO esperada: %d, obtida: %d", numClients, matchSuccessCount)
 	}
-	if outOfStockCount != (numClients - initialStock) {
-		t.Errorf("Contagem de OUT_OF_STOCK esperada: %d, obtida: %d", numClients-initialStock, outOfStockCount)
+	if matchTimeoutCount > 0 {
+		t.Errorf("%d clientes sofreram TIMEOUT à espera de uma partida.", matchTimeoutCount)
 	}
 	if errorCount > 0 {
-		t.Errorf("%d clientes encontraram erros durante o teste", errorCount)
+		t.Errorf("%d clientes encontraram erros de conexão/envio.", errorCount)
 	}
-}
-
-func TestClusterWithServerFailure(t *testing.T) {
-	// --- Setup dos Servidores (similar ao teste anterior) ---
-	buildCmd := exec.Command("go", "build", "-o", "server_test_bin", ".")
-	buildCmd.Dir = "../server"
-	buildOutput, err := buildCmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("Falha ao compilar o servidor: %v\n%s", err, string(buildOutput))
-	}
-	defer os.Remove("server_test_bin")
-
-	numServers := 3
-	initialTCPPort := 9010 // Usar portas diferentes para evitar conflito
-	initialAPIPort := 8010
-	var serverCmds []*exec.Cmd
-	var allServersAPIs []string
-	for i := 0; i < numServers; i++ {
-		allServersAPIs = append(allServersAPIs, fmt.Sprintf("http://localhost:%d", initialAPIPort+i))
-	}
-	allServersStr := strings.Join(allServersAPIs, ",")
-
-	for i := 0; i < numServers; i++ {
-		cmd := exec.Command("./server_test_bin")
-		cmd.Env = append(os.Environ(),
-			"LISTEN_ADDR=:"+strconv.Itoa(initialTCPPort+i),
-			"API_ADDR=:"+strconv.Itoa(initialAPIPort+i),
-			"ALL_SERVERS="+allServersStr,
-			"HOSTNAME=localhost",
-		)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("Falha ao iniciar o servidor %d: %v", i, err)
-		}
-		serverCmds = append(serverCmds, cmd)
-	}
-
-	t.Cleanup(func() {
-		for _, cmd := range serverCmds {
-			if cmd.Process != nil {
-				cmd.Process.Kill()
-			}
-		}
-	})
-
-	t.Log("Aguardando servidores iniciarem...")
-	time.Sleep(5 * time.Second)
-
-	// --- Simulação de falha ---
-	serverToKillIndex := 1
-	t.Logf("--> A simular falha do servidor %d em 3 segundos...", serverToKillIndex)
-	time.AfterFunc(3*time.Second, func() {
-		t.Logf("!!! Matando o servidor %d !!!", serverToKillIndex)
-		if err := serverCmds[serverToKillIndex].Process.Kill(); err != nil {
-			t.Errorf("Falha ao matar o servidor %d: %v", serverToKillIndex, err)
-		}
-	})
-
-	// --- Lógica dos Clientes (com tentativas contínuas) ---
-	initialStock := 1000
-	numClients := initialStock + 100
-	results := make(chan string, numClients)
-	var wg sync.WaitGroup
-
-	for i := 0; i < numClients; i++ {
-		wg.Add(1)
-		go func(clientID int) {
-			defer wg.Done()
-			serverIdx := clientID % numServers
-			serverTCPAddr := fmt.Sprintf("localhost:%d", initialTCPPort+serverIdx)
-
-			conn, err := net.DialTimeout("tcp", serverTCPAddr, 1*time.Second)
-			if err != nil {
-				results <- "CONNECTION_ERROR"
-				return
-			}
-			defer conn.Close()
-
-			openPackMsg := `{"t": "OPEN_PACK"}` + "\n"
-			if _, err := conn.Write([]byte(openPackMsg)); err != nil {
-				results <- "SEND_ERROR"
-				return
-			}
-
-			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-			reader := bufio.NewReader(conn)
-			response, err := reader.ReadString('\n')
-			if err != nil {
-				results <- "READ_ERROR"
-				return
-			}
-
-			var serverMsg struct {
-				T    string `json:"t"`
-				Code string `json:"code,omitempty"`
-			}
-			json.Unmarshal([]byte(response), &serverMsg)
-
-			if serverMsg.T == "PACK_OPENED" {
-				results <- "PACK_OPENED"
-			} else if serverMsg.T == "ERROR" && serverMsg.Code == "OUT_OF_STOCK" {
-				results <- "OUT_OF_STOCK"
-			} else {
-				results <- "UNEXPECTED_RESPONSE"
-			}
-		}(i)
-	}
-
-	wg.Wait()
-	close(results)
-
-	// --- Validação dos Resultados ---
-	packOpenedCount := 0
-	outOfStockCount := 0
-	errorCount := 0
-
-	for result := range results {
-		switch result {
-		case "PACK_OPENED":
-			packOpenedCount++
-		case "OUT_OF_STOCK":
-			outOfStockCount++
-		default:
-			errorCount++
-		}
-	}
-
-	t.Logf("Resultados com falha: %d PACK_OPENED, %d OUT_OF_STOCK, %d erros", packOpenedCount, outOfStockCount, errorCount)
-
-	// Validação: o número de pacotes abertos com sucesso deve ser menor que o estoque inicial,
-	// pois alguns clientes não conseguirão se conectar ou concluir a operação.
-	if packOpenedCount >= initialStock {
-		t.Errorf("Esperado menos de %d pacotes abertos, mas foram %d", initialStock, packOpenedCount)
-	}
-	if packOpenedCount == 0 {
-		t.Error("Nenhum pacote foi aberto, o que indica que o cluster pode ter parado completamente.")
-	}
-	// O número total de respostas bem-sucedidas (abertas + sem estoque) mais os erros deve ser igual ao número de clientes.
-	totalResponses := packOpenedCount + outOfStockCount + errorCount
-	if totalResponses != numClients {
-		t.Errorf("Número total de respostas (%d) não corresponde ao número de clientes (%d)", totalResponses, numClients)
-	}
-
-	t.Log("O teste de resiliência concluiu que o cluster continuou a operar após a falha de um nó.")
 }

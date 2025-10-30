@@ -59,35 +59,60 @@ func (s *MatchmakingService) Run() {
 	}
 }
 
-// processMatchmakingQueue verifica a fila de jogadores e tenta criar partidas.
+// processMatchmakingQueue verifica a fila de jogadores e tenta criar partidas
+// em loop até a fila estar vazia ou não ser possível formar mais pares.
 func (s *MatchmakingService) processMatchmakingQueue() {
-	playersInQueue := s.stateManager.GetMatchmakingQueueSnapshot()
+	log.Println("[MATCHMAKING] A processar a fila em loop...")
 
-	if len(playersInQueue) >= 2 {
-		p1 := playersInQueue[0]
-		p2 := playersInQueue[1]
+	// Loop contínuo para processar o máximo de jogadores possível
+	for {
+		// Obtém um snapshot ATUALIZADO da fila a cada iteração
+		playersInQueue := s.stateManager.GetMatchmakingQueueSnapshot()
 
-		// Tenta criar a partida com cartas do token
-		match, err := s.createMatchWithTokenCards(p1, p2, false, "", "")
-		if err != nil {
-			log.Printf("[MATCHMAKING] Erro ao criar partida: %v", err)
-			return
+		if len(playersInQueue) >= 2 {
+			// --- Há jogadores suficientes para uma partida local ---
+			log.Printf("[MATCHMAKING] Fila com %d jogadores. A criar partida local...", len(playersInQueue))
+			
+			p1 := playersInQueue[0]
+			p2 := playersInQueue[1]
+
+			// Tenta criar a partida com cartas do token
+			match, err := s.createMatchWithTokenCards(p1, p2, false, "", "")
+			if err != nil {
+				log.Printf("[MATCHMAKING] Erro ao criar partida com cartas do token: %v. A parar processamento.", err)
+				return // Se falhar (ex: token sem cartas), sai do loop
+			}
+
+			s.stateManager.RemovePlayersFromQueue(p1, p2)
+			s.notifyPlayersOfMatch(match, p1, p2)
+			go s.monitorMatch(match)
+			
+			// O loop continua (com 'continue' implícito) para verificar p3, p4, etc.
+
+		} else if len(playersInQueue) == 1 {
+			// --- Há apenas um jogador, tenta partida distribuída ---
+			player := playersInQueue[0]
+			log.Printf("[MATCHMAKING] Fila com 1 jogador. A tentar encontrar oponente distribuído para %s...", player.ID)
+			
+			if found := s.findAndCreateDistributedMatch(player); !found {
+				// Se não encontrou um par distribuído, não há mais nada a fazer.
+				log.Printf("[MATCHMAKING] Nenhum oponente distribuído encontrado para %s. A parar processamento.", player.ID)
+				return // Sai do loop
+			}
+			// Se 'found' for verdadeiro, o jogador foi removido da fila.
+			// O loop continua para verificar se outro jogador entrou entretanto.
+
+		} else {
+			// --- Fila vazia ---
+			log.Println("[MATCHMAKING] Fila vazia. A parar processamento.")
+			return // Sai do loop
 		}
 
-		s.stateManager.RemovePlayersFromQueue(p1, p2)
-		s.notifyPlayersOfMatch(match, p1, p2)
-		go s.monitorMatch(match)
-	} else if len(playersInQueue) == 1 {
-		player := playersInQueue[0]
-		log.Printf("[MATCHMAKING] A tentar encontrar um oponente distribuído para %s...", player.ID)
-		if found := s.findAndCreateDistributedMatch(player); !found {
-			log.Printf("[MATCHMAKING] Nenhum oponente distribuído encontrado para %s.", player.ID)
-		}
-	} else {
-		log.Println("[MATCHMAKING] Fila vazia.")
+		// Adiciona uma pequena pausa para evitar sobrecarregar a CPU se algo der errado
+		// (Opcional, mas seguro)
+		// time.Sleep(50 * time.Millisecond)
 	}
 }
-
 // createMatchWithTokenCards cria uma partida usando cartas do token
 func (s *MatchmakingService) createMatchWithTokenCards(p1, p2 *protocol.PlayerConn, isDistributed bool, guestServer string, matchID string) (*game.Match, error) {
 	// Verifica se o token está disponível
