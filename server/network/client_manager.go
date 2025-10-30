@@ -15,6 +15,18 @@ func (s *TCPServer) handleConn(conn net.Conn) {
 	peer := conn.RemoteAddr().String()
 	log.Printf("[CLIENT_MGR] Nova conexão aceite de %s", peer)
 
+    // Otimizações de socket para alto número de clientes
+    if tcp, ok := conn.(*net.TCPConn); ok {
+        // Evita Nagle: menor latência para mensagens pequenas
+        _ = tcp.SetNoDelay(true)
+        // Buffers razoáveis para reduzir pressão em writes sob carga
+        _ = tcp.SetReadBuffer(1 << 16)  // 64KB
+        _ = tcp.SetWriteBuffer(1 << 16) // 64KB
+        // Mantém conexões ativas e detecta quedas mais cedo
+        _ = tcp.SetKeepAlive(true)
+        _ = tcp.SetKeepAlivePeriod(30 *  time.Second)
+    }
+
 	player := protocol.NewPlayerConn(peer, conn)
 	s.stateManager.AddPlayerOnline(player)
 

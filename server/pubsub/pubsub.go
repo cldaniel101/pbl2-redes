@@ -33,7 +33,9 @@ func (b *Broker) Subscribe(topic string) Subscriber {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	sub := make(Subscriber, 1) // Buffered channel
+    // Aumenta o buffer para suportar picos sem bloquear writers sob carga
+    // Valor moderado para evitar consumo excessivo de memória por assinante
+    sub := make(Subscriber, 128)
 	b.subscribers[sub] = true
 
 	if b.topics[topic] == nil {
