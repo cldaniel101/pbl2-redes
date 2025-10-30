@@ -88,6 +88,9 @@ func main() {
 		thisServerAddress,
 	)
 
+	// Conecta o receptor de token de cartas ao serviço de matchmaking
+	apiServer.SetTokenReceiver(matchmakingService)
+
 	// sm *state.StateManager, broker *pubsub.Broker, tokenChan chan<- protocol.TokenState, serverAddr string
 
 	// Servidor TCP (para comunicação com os clientes)

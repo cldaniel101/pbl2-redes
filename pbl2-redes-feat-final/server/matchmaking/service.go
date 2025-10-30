@@ -13,6 +13,7 @@ import (
 	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
 	"pingpong/server/state"
+    "pingpong/server/token"
 )
 
 // MatchmakingService gere o processo de emparelhar jogadores,
@@ -28,6 +29,7 @@ type MatchmakingService struct {
 	isLeader          bool                     // Flag para indicar se este nó é o líder
 	lastKnownStock    int                      // Último estoque conhecido (para regeneração inteligente)
 	totalPacksOpened  int                      // Total de pacotes abertos desde o início
+    currentToken      *token.Token             // Token com pool de cartas
 }
 
 // NewService cria uma nova instância do serviço de matchmaking.
@@ -63,10 +65,11 @@ func (s *MatchmakingService) runFollower() {
 	log.Println("[MATCHMAKING] Serviço (Seguidor) iniciado. A aguardar pelo token...")
 	for tokenState := range s.tokenChan {
 		log.Printf("[MATCHMAKING] Token recebido. Estado: %+v. A verificar a fila...", tokenState)
+        s.ensureTokenInitialized()
 		updatedTokenState := s.processPackRequests(tokenState)
 		s.processMatchmakingQueue()
 		time.Sleep(2 * time.Second) // Simula trabalho
-		s.passTokenToNextServer(updatedTokenState)
+        s.passTokenToNextServer(updatedTokenState)
 	}
 	log.Println("[MATCHMAKING] Canal do token fechado. Encerrando (Seguidor).")
 }
@@ -96,6 +99,7 @@ func (s *MatchmakingService) runLeader() {
 			timer.Reset(watchdogTimeout)
 
 			// Processa e passa o token
+            s.ensureTokenInitialized()
 			updatedTokenState := s.processPackRequests(tokenState)
 			s.processMatchmakingQueue()
 			time.Sleep(2 * time.Second) // Simula trabalho
@@ -156,6 +160,7 @@ func (s *MatchmakingService) runLeader() {
 			// (Se o token se perdeu, 's.nextServerAddress' continua o mesmo N+1).
 			log.Println("[MATCHMAKING] [LEADER] A regenerar e processar token...")
 			tokenState := protocol.TokenState{PackStock: s.lastKnownStock}
+            s.ensureTokenInitialized()
 			updatedTokenState := s.processPackRequests(tokenState)
 			s.processMatchmakingQueue()
 			time.Sleep(2 * time.Second) // Simula trabalho
@@ -221,7 +226,11 @@ func (s *MatchmakingService) processMatchmakingQueue() {
 		p1 := playersInQueue[0]
 		p2 := playersInQueue[1]
 		s.stateManager.RemovePlayersFromQueue(p1, p2)
-		match := s.stateManager.CreateLocalMatch(p1, p2, s.broker)
+        match, err := s.createMatchWithTokenCards(p1, p2, false, "", "")
+        if err != nil {
+            log.Printf("[MATCHMAKING] Erro ao criar partida local com cartas do token: %v. A criar partida padrão.", err)
+            match = s.stateManager.CreateLocalMatch(p1, p2, s.broker)
+        }
 		s.notifyPlayersOfMatch(match, p1, p2)
 		go s.monitorMatch(match)
 	} else if len(playersInQueue) == 1 {
@@ -270,11 +279,22 @@ func (s *MatchmakingService) findAndCreateDistributedMatch(localPlayer *protocol
 
 		log.Printf("[MATCHMAKING] Oponente %s encontrado em %s. A solicitar partida...", opponentInfo.PlayerID, serverAddr)
 		matchID := fmt.Sprintf("dist_match_%d", time.Now().UnixNano())
-		requestBody, _ := json.Marshal(map[string]string{
-			"matchId":       matchID,
-			"hostPlayerId":  localPlayer.ID,
-			"guestPlayerId": opponentInfo.PlayerID,
-		})
+        // Prepara cartas do convidado a partir do token
+        guestCards := []string{}
+        if s.currentToken != nil {
+            if cards, err := s.currentToken.DrawCards(game.HandSize); err == nil {
+                guestCards = cards
+            } else {
+                log.Printf("[MATCHMAKING] Falha ao obter cartas do token para convidado: %v", err)
+            }
+        }
+
+        requestBody, _ := json.Marshal(map[string]interface{}{
+            "matchId":       matchID,
+            "hostPlayerId":  localPlayer.ID,
+            "guestPlayerId": opponentInfo.PlayerID,
+            "guestCards":    guestCards,
+        })
 
 		// Segunda chamada S2S: solicitar a partida
 		resp, err = s.httpClient.Post(serverAddr+"/api/request-match", "application/json", bytes.NewBuffer(requestBody)) //
@@ -296,7 +316,20 @@ func (s *MatchmakingService) findAndCreateDistributedMatch(localPlayer *protocol
 		_ = resp.Body.Close()
 
 		s.stateManager.RemovePlayersFromQueue(localPlayer)
-		match, err := s.stateManager.CreateDistributedMatchAsHost(matchID, localPlayer, opponentInfo.PlayerID, s.serverAddress, serverAddr, s.broker)
+        // Cria partida distribuída como host; tenta usar cartas do token para o host
+        var match *game.Match
+        var err error
+        if s.currentToken != nil {
+            hostCards, derr := s.currentToken.DrawCards(game.HandSize)
+            if derr == nil {
+                match, err = s.stateManager.CreateDistributedMatchAsHostWithCards(matchID, localPlayer, opponentInfo.PlayerID, s.serverAddress, serverAddr, s.broker, hostCards, guestCards)
+            } else {
+                log.Printf("[MATCHMAKING] Falha ao obter cartas do token para host: %v", derr)
+            }
+        }
+        if match == nil && err == nil {
+            match, err = s.stateManager.CreateDistributedMatchAsHost(matchID, localPlayer, opponentInfo.PlayerID, s.serverAddress, serverAddr, s.broker)
+        }
 		if err != nil {
 			log.Printf("[MATCHMAKING] Erro ao criar partida distribuída localmente: %v", err)
 			return false
@@ -312,22 +345,98 @@ func (s *MatchmakingService) findAndCreateDistributedMatch(localPlayer *protocol
 
 // passTokenToNextServer envia uma requisição HTTP para passar o token.
 func (s *MatchmakingService) passTokenToNextServer(currentState protocol.TokenState) {
-	log.Printf("[MATCHMAKING] A passar o token para %s com estado: %+v...", s.nextServerAddress, currentState)
+    // Envia o token de cartas junto (se existir) para “regeneração” do dono
+    if s.currentToken != nil {
+        s.currentToken.UpdateServerAddr(s.nextServerAddress)
+        tokenJSON, err := s.currentToken.ToJSON()
+        if err == nil {
+            log.Printf("[MATCHMAKING] A passar o token de cartas (%d no pool) para %s...", s.currentToken.GetPoolSize(), s.nextServerAddress)
+            if resp, err2 := s.httpClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(tokenJSON)); err2 == nil {
+                if resp != nil {
+                    _ = resp.Body.Close()
+                }
+                // Limpa token local após passar
+                s.currentToken = nil
+                return
+            } else {
+                log.Printf("[MATCHMAKING] ERRO ao passar token de cartas: %v", err2)
+            }
+        } else {
+            log.Printf("[MATCHMAKING] ERRO ao serializar token de cartas: %v", err)
+        }
+    }
 
-	requestBody, err := json.Marshal(currentState)
-	if err != nil {
-		log.Printf("[MATCHMAKING] ERRO ao serializar o estado do token: %v", err)
-		return
-	}
+    // Fallback: envia apenas o estado de pacotes
+    log.Printf("[MATCHMAKING] A passar o token para %s com estado: %+v...", s.nextServerAddress, currentState)
+    requestBody, err := json.Marshal(currentState)
+    if err != nil {
+        log.Printf("[MATCHMAKING] ERRO ao serializar o estado do token: %v", err)
+        return
+    }
+    _, err = s.httpClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(requestBody))
+    if err != nil {
+        log.Printf("[MATCHMAKING] ERRO ao passar o token para %s: %v.", s.nextServerAddress, err)
+    } else {
+        log.Printf("[MATCHMAKING] Token passado com sucesso.")
+    }
+}
 
-	_, err = s.httpClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(requestBody)) //
-	if err != nil {
-		log.Printf("[MATCHMAKING] ERRO ao passar o token para %s: %v.", s.nextServerAddress, err)
-		// O Watchdog do líder (que está esperando o token voltar)
-		// vai apanhar esta falha eventualmente.
-	} else {
-		log.Printf("[MATCHMAKING] Token passado com sucesso.")
-	}
+// SetToken permite ao servidor de API injetar o token de cartas recebido
+func (s *MatchmakingService) SetToken(t *token.Token) {
+    s.currentToken = t
+}
+
+// ensureTokenInitialized cria e carrega o token a partir do CardDB caso ainda não exista
+func (s *MatchmakingService) ensureTokenInitialized() {
+    if s.currentToken != nil {
+        return
+    }
+    s.currentToken = token.NewToken(s.serverAddress)
+    all := s.stateManager.CardDB.GetAllCards()
+    type cardInfo struct {
+        ID      string `json:"id"`
+        Name    string `json:"name"`
+        Element string `json:"element"`
+        ATK     int    `json:"atk"`
+        DEF     int    `json:"def"`
+    }
+    buf := make([]cardInfo, 0, len(all))
+    for _, c := range all {
+        buf = append(buf, cardInfo{ID: c.ID, Name: c.Name, Element: string(c.Element), ATK: c.ATK, DEF: c.DEF})
+    }
+    raw, _ := json.Marshal(buf)
+    _ = s.currentToken.LoadCardsFromJSON(raw, 10)
+}
+
+// createMatchWithTokenCards cria uma partida usando cartas do token
+func (s *MatchmakingService) createMatchWithTokenCards(p1, p2 *protocol.PlayerConn, isDistributed bool, guestServer string, matchID string) (*game.Match, error) {
+    if s.currentToken == nil {
+        return nil, fmt.Errorf("token não disponível")
+    }
+    totalCardsNeeded := 2 * game.HandSize
+    cards, err := s.currentToken.DrawCards(totalCardsNeeded)
+    if err != nil {
+        return nil, fmt.Errorf("erro ao pegar cartas do token: %w", err)
+    }
+    log.Printf("[MATCHMAKING] Pegou %d cartas do token para a partida", len(cards))
+    p1Cards := cards[:game.HandSize]
+    p2Cards := cards[game.HandSize:]
+    var match *game.Match
+    if isDistributed {
+        match, err = s.stateManager.CreateDistributedMatchAsHostWithCards(
+            matchID,
+            p1,
+            p2.ID,
+            s.serverAddress,
+            guestServer,
+            s.broker,
+            p1Cards,
+            p2Cards,
+        )
+    } else {
+        match = s.stateManager.CreateLocalMatchWithCards(p1, p2, s.broker, p1Cards, p2Cards)
+    }
+    return match, err
 }
 
 // notifyPlayersOfMatch envia a mensagem MATCH_FOUND para os jogadores envolvidos.
