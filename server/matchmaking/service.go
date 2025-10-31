@@ -171,7 +171,6 @@ func (s *MatchmakingService) runLeader() {
 			// 3. Reseta o watchdog.
 			log.Println("[MATCHMAKING] [LEADER] Watchdog resetado após regeneração.")
 			timer.Reset(watchdogTimeout)
-			// --- FIM DA NOVA LÓGICA ---
 		}
 	}
 }
@@ -318,7 +317,6 @@ func (s *MatchmakingService) findAndCreateDistributedMatch(localPlayer *protocol
 		s.stateManager.RemovePlayersFromQueue(localPlayer)
         // Cria partida distribuída como host; tenta usar cartas do token para o host
         var match *game.Match
-        var err error
         if s.currentToken != nil {
             hostCards, derr := s.currentToken.DrawCards(game.HandSize)
             if derr == nil {
