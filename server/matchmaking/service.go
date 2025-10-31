@@ -171,8 +171,27 @@ func (s *MatchmakingService) runLeader() {
 			// 3. Reseta o watchdog.
 			log.Println("[MATCHMAKING] [LEADER] Watchdog resetado após regeneração.")
 			timer.Reset(watchdogTimeout)
+			go s.returnTotheInitialNodes()
 		}
 	}
+}
+
+func (s *MatchmakingService) returnTotheInitialNodes() {
+	time.Sleep(20 * time.Second)
+	myIndex := -1
+	for i, addr := range s.allServers {
+		if addr == s.serverAddress {
+			myIndex = i
+			break
+		}
+	}
+	if myIndex == -1 {
+		log.Fatalf("[MAIN] Endereço do servidor %s não encontrado na lista ALL_SERVERS", s.serverAddress)
+	}
+
+	newNextIndex := (myIndex + 1) % len(s.allServers) 
+	s.nextServerAddress = s.allServers[newNextIndex]
+
 }
 
 // processPackRequests processa a fila de pedidos de pacotes.
