@@ -64,7 +64,7 @@ func (s *MatchmakingService) Run() {
 func (s *MatchmakingService) runFollower() {
 	log.Println("[MATCHMAKING] Serviço (Seguidor) iniciado. A aguardar pelo token...")
 	for tokenState := range s.tokenChan {
-		log.Printf("[MATCHMAKING] Token recebido. Estado: %+v. A verificar a fila...", tokenState)
+		log.Printf("[MATCHMAKING] Token recebido. A verificar a fila...")
         s.ensureTokenInitialized()
 		updatedTokenState := s.processPackRequests(tokenState)
 		s.processMatchmakingQueue()
@@ -178,19 +178,25 @@ func (s *MatchmakingService) runLeader() {
 
 func (s *MatchmakingService) returnTotheInitialNodes() {
 	time.Sleep(20 * time.Second)
-	myIndex := -1
-	for i, addr := range s.allServers {
-		if addr == s.serverAddress {
-			myIndex = i
-			break
+	pingClient := http.Client{Timeout: 2 * time.Second}
+	_, err := pingClient.Get(s.nextServerAddress + "/api/find-opponent") 
+	if err == nil {
+		log.Println("[MATCHMAKING] [LEADER] Voltando para o nó inicial, servidor voltou!.")
+		myIndex := -1
+		for i, addr := range s.allServers {
+			if addr == s.serverAddress {
+				myIndex = i
+				break
+			}
 		}
-	}
-	if myIndex == -1 {
-		log.Fatalf("[MAIN] Endereço do servidor %s não encontrado na lista ALL_SERVERS", s.serverAddress)
-	}
+		if myIndex == -1 {
+			log.Fatalf("[MAIN] Endereço do servidor %s não encontrado na lista ALL_SERVERS", s.serverAddress)
+		}
 
-	newNextIndex := (myIndex + 1) % len(s.allServers) 
-	s.nextServerAddress = s.allServers[newNextIndex]
+		newNextIndex := (myIndex + 1) % len(s.allServers) 
+		s.nextServerAddress = s.allServers[newNextIndex]
+	}
+	
 
 }
 
