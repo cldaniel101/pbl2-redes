@@ -104,7 +104,7 @@ func (t *Token) DrawCards(count int) ([]string, error) {
 // refillPool_unsafe reabastece o pool com todas as cartas disponíveis
 // ATENÇÃO: Este método NÃO é thread-safe, deve ser chamado apenas com o lock já adquirido
 func (t *Token) refillPool_unsafe() {
-	const copiesPerCard = 100 // Número de cópias de cada carta a adicionar
+	const copiesPerCard = 10 // Número de cópias de cada carta a adicionar
 
 	// Cria um novo pool com múltiplas cópias de cada carta
 	newCards := make([]string, 0, len(t.AllCards)*copiesPerCard)

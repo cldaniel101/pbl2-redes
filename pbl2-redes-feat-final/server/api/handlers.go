@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"pingpong/server/protocol"
@@ -24,19 +23,23 @@ type APIServer struct {
 	serverAddr   string
 	// O canal de token é injetado para que o handler possa notificar
 	// o serviço de matchmaking quando o token for recebido.
-	tokenAcquiredChan chan<- bool
+	tokenAcquiredChan chan<- protocol.TokenState
 	tokenReceiver     TokenReceiver
 }
 
 // NewServer cria uma nova instância do servidor da API.
-func NewServer(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan<- bool, serverAddr string, tokenReceiver TokenReceiver) *APIServer {
+func NewServer(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan<- protocol.TokenState, serverAddr string) *APIServer {
 	return &APIServer{
 		stateManager:      sm,
 		broker:            broker,
 		tokenAcquiredChan: tokenChan,
 		serverAddr:        serverAddr,
-		tokenReceiver:     tokenReceiver,
 	}
+}
+
+// SetTokenReceiver configura o destino que receberá o token ao chegar via HTTP
+func (s *APIServer) SetTokenReceiver(r TokenReceiver) {
+    s.tokenReceiver = r
 }
 
 // Router configura e retorna um novo router HTTP com todos os endpoints da API.
@@ -45,7 +48,7 @@ func (s *APIServer) Router() http.Handler {
 	mux.HandleFunc("/api/find-opponent", s.handleFindOpponent)
 	mux.HandleFunc("/api/request-match", s.handleRequestMatch)
 	mux.HandleFunc("/api/receive-token", s.handleReceiveToken)
-	mux.HandleFunc("/matches/", s.handleMatchAction) 
+	mux.HandleFunc("/matches/", s.handleMatchAction)
 	mux.HandleFunc("/api/forward/message", s.handleForwardMessage)
 	return mux
 }
@@ -124,51 +127,53 @@ func (s *APIServer) handleRequestMatch(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleReceiveToken recebe o token com cartas de outro servidor e notifica o serviço de matchmaking.
+// handleReceiveToken recebe o token de outro servidor e notifica o serviço de matchmaking.
 func (s *APIServer) handleReceiveToken(w http.ResponseWriter, r *http.Request) {
-	// Lê o corpo da requisição
-	body, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		log.Printf("[API] Erro ao ler corpo da requisição do token: %v", err)
-		http.Error(w, "Erro ao ler token", http.StatusBadRequest)
-		return
-	}
-	defer r.Body.Close()
+    if r.Method != http.MethodPost {
+        http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+        return
+    }
 
-	// Se o corpo estiver vazio, é o token inicial sem cartas
-	if len(body) == 0 {
-		log.Printf("[API] Recebi token vazio (bootstrap inicial).")
-		select {
-		case s.tokenAcquiredChan <- true:
-		default:
-		}
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+    // Tenta decodificar como token de cartas primeiro
+    var generic map[string]any
+    if err := json.NewDecoder(r.Body).Decode(&generic); err != nil {
+        log.Printf("[API] Erro ao ler corpo do token: %v", err)
+        http.Error(w, "Corpo do pedido inválido", http.StatusBadRequest)
+        return
+    }
 
-	// Deserializa o token
-	receivedToken, err := token.FromJSON(body)
-	if err != nil {
-		log.Printf("[API] Erro ao deserializar token: %v", err)
-		http.Error(w, "Token inválido", http.StatusBadRequest)
-		return
-	}
+    // Re-encode para tentar os dois formatos
+    raw, _ := json.Marshal(generic)
 
-	log.Printf("[API] Recebi o token com %d cartas no pool.", receivedToken.GetPoolSize())
+    // 1) Formato token de cartas
+    if t, err := token.FromJSON(raw); err == nil {
+        log.Printf("[API] Recebi token de cartas com %d no pool.", t.GetPoolSize())
+        if s.tokenReceiver != nil {
+            s.tokenReceiver.SetToken(t)
+        }
+        // Notifica o serviço de matchmaking para iniciar o ciclo
+        select {
+        case s.tokenAcquiredChan <- protocol.TokenState{PackStock: 0}: // payload não importa aqui
+        default:
+        }
+        w.WriteHeader(http.StatusOK)
+        return
+    }
 
-	// Passa o token para o serviço de matchmaking
-	if s.tokenReceiver != nil {
-		s.tokenReceiver.SetToken(receivedToken)
-	}
+    // 2) Formato de estado de pacotes
+    var tokenState protocol.TokenState
+    if err := json.Unmarshal(raw, &tokenState); err == nil {
+        log.Printf("[API] Recebi o token do servidor anterior com estado: %+v", tokenState)
+        select {
+        case s.tokenAcquiredChan <- tokenState:
+        default:
+            log.Println("[API] Aviso: canal do token bloqueado, não foi possível enviar o estado.")
+        }
+        w.WriteHeader(http.StatusOK)
+        return
+    }
 
-	// Notifica o matchmaking que pode começar a sua verificação
-	select {
-	case s.tokenAcquiredChan <- true:
-	default:
-		// Evita bloquear se o serviço de matchmaking não estiver pronto para receber
-	}
-
-	w.WriteHeader(http.StatusOK)
+    http.Error(w, "Formato de token inválido", http.StatusBadRequest)
 }
 
 // handleMatchAction recebe uma ação de um jogador remoto (ex: jogar uma carta)
