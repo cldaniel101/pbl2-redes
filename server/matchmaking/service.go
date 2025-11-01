@@ -89,7 +89,7 @@ func NewService(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan *t
 // getWatchdogTimeout calcula a duração do watchdog do líder.
 func (s *MatchmakingService) getWatchdogTimeout() time.Duration {
 	// O timeout do líder deve ser dinâmico e razoavelmente curto
-	return time.Duration(len(s.allServers)*4) * time.Second
+	return time.Duration(len(s.allServers)*16) * time.Second
 }
 
 // getElectionTimeout calcula a duração do timer de eleição do seguidor.
@@ -97,7 +97,7 @@ func (s *MatchmakingService) getElectionTimeout() time.Duration {
 	// Deve ser significativamente mais longo que o watchdog para dar
 	// tempo ao líder de regenerar o token antes que os seguidores
 	// pensem que ele morreu.
-	return s.getWatchdogTimeout() * 3
+	return s.getWatchdogTimeout() * 2
 }
 
 // resetTimers reinicia o timer apropriado com base no estado de líder.
@@ -165,7 +165,7 @@ func (s *MatchmakingService) processPackRequests() {
 }
 
 func (s *MatchmakingService) promoteToLeader() {
-    // ... (lógica de Lock) ...
+    s.leaderMu.Lock()
     s.isLeader = true
     s.leaderMu.Unlock()
 
@@ -198,21 +198,13 @@ func (s *MatchmakingService) Run() {
 			log.Println("[MATCHMAKING] Token de cartas recebido. A processar...")
 			s.currentToken = receivedToken // Armazena o token recebido
 
-			s.leaderMu.Lock()
-			// NOTA: A lógica 'tokenState.GeneratedByLeaderIdx' não existe
-			// no token.Token. Se a lógica de eleição avançada for
-			// necessária, esse campo precisaria ser adicionado ao token.Token.
-			s.leaderMu.Unlock()
-
 			// O anel está vivo. Reinicia o timer apropriado.
 			s.resetTimers()
-
-			// NÃO É MAIS NECESSÁRIO: s.ensureTokenInitialized()
 
 			// Processa as filas usando s.currentToken
 			s.processPackRequests()
 			s.processMatchmakingQueue()
-			time.Sleep(2 * time.Second) // Simula trabalho
+			time.Sleep(10 * time.Second) // Simula trabalho
 
 			// Passa o token (que está em s.currentToken)
 			s.passTokenToNextServer()
@@ -221,66 +213,45 @@ func (s *MatchmakingService) Run() {
 		case <-s.watchdogTimer.C:
 			s.leaderMu.Lock()
 			if !s.isLeader {
-				// Timer espúrio. Fomos demitidos enquanto o timer corria.
+				// Timer espúrio. Fomos rebaixados para seguidor,
+				// mas o timer antigo disparou antes de ser parado.
 				s.leaderMu.Unlock()
-				log.Println("[MATCHMAKING] Watchdog espúrio. Ignorando.")
-				s.resetTimers() // Apenas reinicia (vai iniciar o timer de eleição)
-				continue
+				
+				log.Println("[MATCHMAKING] Watchdog espúrio (nó não é líder). Ignorando.")
+				s.resetTimers() // Garante que o timer de eleição seja iniciado
+				continue        // PULA O RESTO DA LÓGICA
 			}
-			s.leaderMu.Unlock()
+			s.leaderMu.Unlock() // Se chegamos aqui, somos o líder
 
-			// --- Lógica de Falha do Líder (código original de runLeader) ---
+			// --- Lógica de Falha do Líder (agora segura) ---
 			log.Printf("[MATCHMAKING] [LEADER] Watchdog timeout! O token não retornou.")
 			log.Printf("[MATCHMAKING] [LEADER] A verificar ativamente o status do próximo nó: %s", s.nextServerAddress)
 
-			// 1. Tenta "pingar" o próximo servidor
-			// Usamos /api/find-opponent pois sabemos que ele existe
-			resp, err := s.httpClient.Get(s.nextServerAddress + "/api/find-opponent")
-
-			if err != nil {
-				// CASO 1: SERVIDOR CAIU
-				log.Printf("[MATCHMAKING] [LEADER] VERIFICAÇÃO FALHOU: O nó %s está inacessível (%v).", s.nextServerAddress, err)
-				log.Println("[MATCHMAKING] [LEADER] A reconfigurar anel para pular o nó falho.")
-
-				// Reconfigura o anel para pular o nó N+1 e ir para o N+2
-				myIndexInList := -1
-				for i, addr := range s.allServers {
-					if addr == s.serverAddress {
-						myIndexInList = i
-						break
-					}
-				}
-
-				if myIndexInList != -1 {
-					newNextIndex := (myIndexInList + 2) % len(s.allServers) // Lógica de pular (N+2)
-					originalNext := s.nextServerAddress
-					s.nextServerAddress = s.allServers[newNextIndex]
-					log.Printf("[MATCHMAKING] [LEADER] Topologia reconfigurada. Próximo nó é: %s (pulado: %s)", s.nextServerAddress, originalNext)
-				} else {
-					log.Printf("[MATCHMAKING] [LEADER] ERRO CRÍTICO: Não foi possível encontrar o próprio endereço.")
-				}
-
-			} else {
-				// CASO 2: TOKEN SE PERDEU
+			// Esta verificação de nó é opcional. O líder pode simplesmente
+			// assumir que o token se perdeu e regenerar.
+			// A lógica de falha de nó é tratada em passTokenToNextServer.
+			resp, err := s.httpClient.Get(s.nextServerAddress + "/api/health-check")
+			if err == nil {
 				_ = resp.Body.Close()
 				log.Printf("[MATCHMAKING] [LEADER] VERIFICAÇÃO OK: O nó %s está VIVO. Assumindo TOKEN PERDIDO.", s.nextServerAddress)
+			} else {
+				log.Printf("[MATCHMAKING] [LEADER] VERIFICAÇÃO FALHOU: O nó %s pode estar MORTO. A assumir TOKEN PERDIDO.", s.nextServerAddress)
+				// A lógica em passTokenToNextServer tratará de reconfigurar o anel na próxima passagem.
 			}
-
-			// 2. Regenera, processa e passa o token.
+			
 			log.Println("[MATCHMAKING] [LEADER] A regenerar e processar token...")
 			s.regenerateAndSetToken() // Define s.currentToken
 
 			// Processa as filas locais com o novo token
 			s.processPackRequests()
 			s.processMatchmakingQueue()
-			time.Sleep(2 * time.Second) 
+			time.Sleep(2 * time.Second) // Simula trabalho
 
 			log.Println("[MATCHMAKING] [LEADER] A repassar token...")
 			s.passTokenToNextServer() // Passa o s.currentToken
 
-			// 3. Reseta o watchdog.
-			s.watchdogTimer.Reset(s.getWatchdogTimeout())
-			go s.returnTotheInitialNodes()
+			// Reinicia o timer do líder
+			s.resetTimers()
 
 		// --- Caso 3: Timer de Eleição do SEGUIDOR dispara (Líder morreu) ---
 		case <-s.electionTimer.C:
@@ -288,8 +259,8 @@ func (s *MatchmakingService) Run() {
 			if s.isLeader {
 				// Timer espúrio. Fomos promovidos enquanto o timer corria.
 				s.leaderMu.Unlock()
-				log.Println("[MATCHMAKING] Timer de eleição espúrio. Ignorando.")
-				s.resetTimers() // Apenas reinicia (vai iniciar o watchdog)
+				log.Println("[MATCHMAKING] Timer de eleição espúrio (nó já é líder). Ignorando.")
+				s.resetTimers() // Garante que o watchdog seja iniciado
 				continue
 			}
 			s.leaderMu.Unlock()
@@ -297,7 +268,6 @@ func (s *MatchmakingService) Run() {
 			log.Println("[MATCHMAKING] [FOLLOWER] Timer de eleição disparou. Líder presumivelmente morto. A iniciar eleição...")
 
 			// Algoritmo "Bully" Simplificado:
-			// Verifica se algum nó com índice MENOR (prioridade maior) está vivo.
 			highestPriorityNodeAlive := false
 			for i := 0; i < s.myIndex; i++ {
 				addr := s.allServers[i]
@@ -306,49 +276,66 @@ func (s *MatchmakingService) Run() {
 				pingClient := http.Client{Timeout: 1 * time.Second}
 				// Usamos /api/find-opponent como "health check"
 				if resp, err := pingClient.Get(addr + "/api/find-opponent"); err == nil {
-					// Nó de prioridade mais alta está VIVO.
 					_ = resp.Body.Close()
 					log.Printf("[MATCHMAKING] [ELECTION] Nó %s está vivo. Não me tornarei líder.", addr)
 					highestPriorityNodeAlive = true
-					break // Encerra a verificação
+					break 
 				}
 			}
 
 			if !highestPriorityNodeAlive {
 				// Ninguém com prioridade mais alta (índice menor) está vivo.
 				// Nós tornamo-nos o novo líder.
+				// promoteToLeader irá regenerar o token perdido.
 				s.promoteToLeader()
 			} else {
 				// Alguém com prioridade mais alta está vivo.
 				// Apenas reiniciamos o nosso timer de eleição e esperamos.
 				log.Println("[MATCHMAKING] [ELECTION] Outro nó deve tornar-se líder. A aguardar.")
-				s.electionTimer.Reset(s.getElectionTimeout())
+				s.resetTimers() // Reinicia o electionTimer
 			}
 		}
 	}
 }
 
-func (s *MatchmakingService) returnTotheInitialNodes() {
-	time.Sleep(20 * time.Second)
-	pingClient := http.Client{Timeout: 2 * time.Second}
-	_, err := pingClient.Get(s.nextServerAddress + "/api/find-opponent")
-	if err == nil {
-		log.Println("[MATCHMAKING] [LEADER] Voltando para o nó inicial, servidor voltou!.")
-		myIndex := -1
-		for i, addr := range s.allServers {
-			if addr == s.serverAddress {
-				myIndex = i
-				break
-			}
-		}
-		if myIndex == -1 {
-			log.Fatalf("[MAIN] Endereço do servidor %s não encontrado na lista ALL_SERVERS", s.serverAddress)
-		}
+func (s *MatchmakingService) monitorFailedNode(failedNodeAddress string) {
+    log.Printf("[MATCHMAKING] [LEADER] Iniciando monitoramento em background do nó falho: %s", failedNodeAddress)
+    
+    pingClient := http.Client{Timeout: 2 * time.Second}
+    
+    // Ticker é melhor para loops, para não recriar a goroutine
+    ticker := time.NewTicker(20 * time.Second) 
+    defer ticker.Stop()
 
-		newNextIndex := (myIndex + 1) % len(s.allServers)
-		s.nextServerAddress = s.allServers[newNextIndex]
-	}
+    // Este é o endereço que queremos restaurar
+    originalNextAddress := s.allServers[(s.myIndex+1)%len(s.allServers)]
 
+    // Verificação de sanidade
+    if failedNodeAddress != originalNextAddress {
+        log.Printf("[MATCHMAKING] [LEADER] Lógica de monitoramento inconsistente. Abortando. Nó falho: %s, Nó original esperado: %s", failedNodeAddress, originalNextAddress)
+        return
+    }
+
+    // Loop infinito de verificação
+    for range ticker.C {
+        // Pinga o nó que FALHOU (não s.nextServerAddress)
+        _, err := pingClient.Get(failedNodeAddress + "/api/health-check")
+        
+        if err == nil {
+            // SUCESSO! O nó falho original voltou!
+            log.Printf("[MATCHMAKING] [LEADER] Nó original %s voltou! A reconfigurar anel.", failedNodeAddress)
+
+            // Reconfigura o 'nextServerAddress' para o nó que acabou de voltar
+            // É seguro fazer isso, pois o líder é o único que muda s.nextServerAddress
+            s.nextServerAddress = failedNodeAddress
+            
+            // A goroutine termina seu trabalho e sai do loop/função.
+            return
+        }
+
+        // FALHA: O servidor ainda não voltou
+        log.Printf("[MATCHMAKING] [LEADER] Monitoramento: Nó %s ainda offline.", failedNodeAddress)
+    }
 }
 
 // processMatchmakingQueue verifica a fila de jogadores e tenta criar partidas.
@@ -505,8 +492,34 @@ func (s *MatchmakingService) passTokenToNextServer() {
         log.Printf("[MATCHMAKING] Token passado com sucesso.")
     } else {
         log.Printf("[MATCHMAKING] ERRO ao passar token de cartas: %v", err2)
-        // NOTA: Se falhar, s.currentToken *não* é limpo,
-        // e o líder (se formos nós) irá detetar e tentar novamente.
+		_, errHealth := http.Get(s.nextServerAddress + "/api/health-check")
+		time.Sleep(10 * time.Second)
+		if errHealth != nil {
+			log.Printf("[MATCHMAKING] [LEADER] VERIFICAÇÃO FALHOU: O nó %s está inacessível (%v).", s.nextServerAddress, err2) // 'err' aqui pode ser 'err2' do post
+			log.Println("[MATCHMAKING] [LEADER] A reconfigurar anel para pular o nó falho.")
+
+			newNextIndex := (s.myIndex + 2) % len(s.allServers) // Lógica de pular (N+2)
+			
+			// 1. Salve o endereço do nó que acabou de falhar
+			originalNextFailedNode := s.nextServerAddress 
+			
+			// 2. Configure o novo 'nextServerAddress' para pular o nó
+			s.nextServerAddress = s.allServers[newNextIndex]
+
+			log.Printf("[MATCHMAKING] [LEADER] Topologia reconfigurada. Próximo nó é: %s (pulado: %s)", s.nextServerAddress, originalNextFailedNode)
+
+			log.Println("[MATCHMAKING] [LEADER] A repassar token...")
+			// Tenta repassar para o novo nó imediatamente
+			postClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(tokenJSON))
+
+			// 3. Reseta o watchdog.
+			s.watchdogTimer.Reset(s.getWatchdogTimeout())
+			
+			// 4. Inicie o monitoramento passando o nó FALHO como argumento
+			go s.monitorFailedNode(originalNextFailedNode)
+		} else {
+			postClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(tokenJSON))
+		}
     }
 }
 

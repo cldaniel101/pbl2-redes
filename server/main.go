@@ -59,7 +59,7 @@ func main() {
 			log.Fatalf("[MAIN] Erro ao ler cards.json: %v", err)
 		}
 
-		// Carrega as cartas no token (100 cópias de cada carta)
+		// Carrega as cartas no token (10 cópias de cada carta)
 		if err := initialToken.LoadCardsFromJSON(cardsData, 10); err != nil {
 			log.Fatalf("[MAIN] Erro ao carregar cartas no token: %v", err)
 		}
