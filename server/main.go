@@ -1,7 +1,6 @@
 package main
 
 import (
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -12,7 +11,6 @@ import (
 	"pingpong/server/state"
 	"pingpong/server/token"
 	"strings"
-	"time"
 )
 
 func main() {
@@ -46,26 +44,6 @@ func main() {
 
 	// Canal para o APIServer notificar o MatchmakingService quando o token chegar.
 	tokenAcquiredChan := make(chan *token.Token, 1)
-
-	// 2.1. Inicialização do Token (apenas no primeiro servidor)
-	var initialToken *token.Token
-	if myIndex == 0 {
-		// O primeiro servidor cria e carrega o token com as cartas
-		initialToken = token.NewToken(thisServerAddress)
-
-		// Lê o arquivo cards.json
-		cardsData, err := ioutil.ReadFile("cards.json")
-		if err != nil {
-			log.Fatalf("[MAIN] Erro ao ler cards.json: %v", err)
-		}
-
-		// Carrega as cartas no token (10 cópias de cada carta)
-		if err := initialToken.LoadCardsFromJSON(cardsData, 10); err != nil {
-			log.Fatalf("[MAIN] Erro ao carregar cartas no token: %v", err)
-		}
-
-		log.Printf("[MAIN] Token inicial criado com %d cartas", initialToken.GetPoolSize())
-	}
 
 	// 3. Injeção de Dependências e Inicialização dos Serviços
 
@@ -111,18 +89,7 @@ func main() {
 	// Inicia o serviço de matchmaking em segundo plano
 	go matchmakingService.Run()
 
-	// 5. Lógica de Arranque do Token
-	// O primeiro servidor na lista é responsável por criar e iniciar o token.
-	if myIndex == 0 {
-		go func() {
-			time.Sleep(5 * time.Second) // Espera pelos outros servidores
-			log.Printf("[MAIN] A injetar token inicial de cartas (%d cartas) no anel...", initialToken.GetPoolSize())
-			// Envia o token de cartas *real* para o canal
-			tokenAcquiredChan <- initialToken 
-		}()
-	}
-
-	// 6. Iniciar o Servidor TCP (bloqueia a goroutine principal)
+	// 5. Iniciar o Servidor TCP (bloqueia a goroutine principal)
 	// Este deve ser o último passo, pois Listen() é uma operação de bloqueio.
 	log.Printf("[MAIN] A iniciar servidor TCP para jogadores em %s...", tcpAddr)
 	if err := tcpServer.Listen(); err != nil {
