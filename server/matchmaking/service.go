@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"io/ioutil"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"pingpong/server/game"
@@ -23,18 +23,18 @@ type MatchmakingService struct {
 	stateManager      *state.StateManager
 	broker            *pubsub.Broker
 	httpClient        *http.Client
-	serverAddress     string                   // Endereço deste servidor (ex: http://server-1:8000)
-	allServers        []string                 // Lista de todos os servidores no cluster
-	nextServerAddress string                   // O próximo servidor no anel
+	serverAddress     string            // Endereço deste servidor (ex: http://server-1:8000)
+	allServers        []string          // Lista de todos os servidores no cluster
+	nextServerAddress string            // O próximo servidor no anel
 	tokenChan         chan *token.Token // Canal para receber e (no líder) reinjetar o token
-	myIndex           int                      // Nosso índice na lista allServers
-	isLeader          bool                     //  Flag para indicar se este nó é o líder
-	leaderMu          sync.Mutex               //  Mutex para proteger a flag isLeader
-	watchdogTimer     *time.Timer              //  Timer do líder
-	electionTimer     *time.Timer              //  Timer do seguidor
-	lastKnownStock    int                      // Último estoque conhecido (para regeneração inteligente)
-	totalPacksOpened  int                      // Total de pacotes abertos desde o início
-	currentToken      *token.Token             // Token com pool de cartas
+	myIndex           int               // Nosso índice na lista allServers
+	isLeader          bool              //  Flag para indicar se este nó é o líder
+	leaderMu          sync.Mutex        //  Mutex para proteger a flag isLeader
+	watchdogTimer     *time.Timer       //  Timer do líder
+	electionTimer     *time.Timer       //  Timer do seguidor
+	lastKnownStock    int               // Último estoque conhecido (para regeneração inteligente)
+	totalPacksOpened  int               // Total de pacotes abertos desde o início
+	currentToken      *token.Token      // Token com pool de cartas
 }
 
 // NewService cria uma nova instância do serviço de matchmaking.
@@ -129,56 +129,56 @@ func (s *MatchmakingService) resetTimers() {
 
 // promoteToLeader promove este nó a líder.
 func (s *MatchmakingService) processPackRequests() {
-    requests := s.stateManager.DequeueAllPackRequests()
-    if len(requests) == 0 {
-        return // Sem pedidos, sem trabalho.
-    }
+	requests := s.stateManager.DequeueAllPackRequests()
+	if len(requests) == 0 {
+		return // Sem pedidos, sem trabalho.
+	}
 
-    // Se não tivermos o token de cartas, não podemos processar.
-    // Os pedidos ficarão na fila para a próxima volta.
-    if s.currentToken == nil {
-        log.Printf("[MATCHMAKING] %d pedidos de pacote em espera, mas o token de cartas não está presente.", len(requests))
-        return
-    }
+	// Se não tivermos o token de cartas, não podemos processar.
+	// Os pedidos ficarão na fila para a próxima volta.
+	if s.currentToken == nil {
+		log.Printf("[MATCHMAKING] %d pedidos de pacote em espera, mas o token de cartas não está presente.", len(requests))
+		return
+	}
 
-    log.Printf("[MATCHMAKING] A processar %d pedidos de pacotes. Pool de cartas atual: %d", len(requests), s.currentToken.GetPoolSize())
+	log.Printf("[MATCHMAKING] A processar %d pedidos de pacotes. Pool de cartas atual: %d", len(requests), s.currentToken.GetPoolSize())
 
-    // O número de cartas por pacote (deveria vir de uma config,
-    // mas 3 é o valor no state/manager.go)
-    const cardsPerPack = 3 
+	// O número de cartas por pacote (deveria vir de uma config,
+	// mas 3 é o valor no state/manager.go)
+	const cardsPerPack = 3
 
-    for _, req := range requests {
-        // Tenta retirar 3 cartas do pool global
-        cards, err := s.currentToken.DrawCards(cardsPerPack)
+	for _, req := range requests {
+		// Tenta retirar 3 cartas do pool global
+		cards, err := s.currentToken.DrawCards(cardsPerPack)
 
-        if err != nil {
-            // Erro (provavelmente pool insuficiente)
-            req.ReplyChan <- state.PackResult{Err: errors.New("estoque de cartas esgotado")}
-            log.Printf("[MATCHMAKING] Pedido de pacote de %s rejeitado: %v", req.PlayerID, err)
-        } else {
-            // Sucesso
-            req.ReplyChan <- state.PackResult{Cards: cards}
-            log.Printf("[MATCHMAKING] Pacote aberto para %s. Cartas: %v. Pool restante: %d", req.PlayerID, cards, s.currentToken.GetPoolSize())
-        }
-    }
-    // s.currentToken foi modificado diretamente (DrawCards removeu cartas)
+		if err != nil {
+			// Erro (provavelmente pool insuficiente)
+			req.ReplyChan <- state.PackResult{Err: errors.New("estoque de cartas esgotado")}
+			log.Printf("[MATCHMAKING] Pedido de pacote de %s rejeitado: %v", req.PlayerID, err)
+		} else {
+			// Sucesso
+			req.ReplyChan <- state.PackResult{Cards: cards}
+			log.Printf("[MATCHMAKING] Pacote aberto para %s. Cartas: %v. Pool restante: %d", req.PlayerID, cards, s.currentToken.GetPoolSize())
+		}
+	}
+	// s.currentToken foi modificado diretamente (DrawCards removeu cartas)
 }
 
 func (s *MatchmakingService) promoteToLeader() {
-    s.leaderMu.Lock()
-    s.isLeader = true
-    s.leaderMu.Unlock()
+	s.leaderMu.Lock()
+	s.isLeader = true
+	s.leaderMu.Unlock()
 
-    s.resetTimers()
+	s.resetTimers()
 
-    log.Println("[MATCHMAKING] [NEW LEADER] A regenerar e injetar o token...")
-    s.regenerateAndSetToken() // Gera o token de cartas (s.currentToken)
+	log.Println("[MATCHMAKING] [NEW LEADER] A regenerar e injetar o token...")
+	s.regenerateAndSetToken() // Gera o token de cartas (s.currentToken)
 
-    // Injeta o token que acabámos de criar no *nosso próprio* canal
-    // para iniciar o ciclo.
-    go func(tokenToInject *token.Token) {
-        s.tokenChan <- tokenToInject
-    }(s.currentToken) 
+	// Injeta o token que acabámos de criar no *nosso próprio* canal
+	// para iniciar o ciclo.
+	go func(tokenToInject *token.Token) {
+		s.tokenChan <- tokenToInject
+	}(s.currentToken)
 }
 
 // Run inicia o loop principal do serviço de matchmaking (agora unificado).
@@ -204,7 +204,7 @@ func (s *MatchmakingService) Run() {
 			// Processa as filas usando s.currentToken
 			s.processPackRequests()
 			s.processMatchmakingQueue()
-			time.Sleep(10 * time.Second) // Simula trabalho
+			time.Sleep(2 * time.Second) // Simula trabalho
 
 			// Passa o token (que está em s.currentToken)
 			s.passTokenToNextServer()
@@ -216,7 +216,7 @@ func (s *MatchmakingService) Run() {
 				// Timer espúrio. Fomos rebaixados para seguidor,
 				// mas o timer antigo disparou antes de ser parado.
 				s.leaderMu.Unlock()
-				
+
 				log.Println("[MATCHMAKING] Watchdog espúrio (nó não é líder). Ignorando.")
 				s.resetTimers() // Garante que o timer de eleição seja iniciado
 				continue        // PULA O RESTO DA LÓGICA
@@ -238,7 +238,7 @@ func (s *MatchmakingService) Run() {
 				log.Printf("[MATCHMAKING] [LEADER] VERIFICAÇÃO FALHOU: O nó %s pode estar MORTO. A assumir TOKEN PERDIDO.", s.nextServerAddress)
 				// A lógica em passTokenToNextServer tratará de reconfigurar o anel na próxima passagem.
 			}
-			
+
 			log.Println("[MATCHMAKING] [LEADER] A regenerar e processar token...")
 			s.regenerateAndSetToken() // Define s.currentToken
 
@@ -279,7 +279,7 @@ func (s *MatchmakingService) Run() {
 					_ = resp.Body.Close()
 					log.Printf("[MATCHMAKING] [ELECTION] Nó %s está vivo. Não me tornarei líder.", addr)
 					highestPriorityNodeAlive = true
-					break 
+					break
 				}
 			}
 
@@ -299,43 +299,43 @@ func (s *MatchmakingService) Run() {
 }
 
 func (s *MatchmakingService) monitorFailedNode(failedNodeAddress string) {
-    log.Printf("[MATCHMAKING] [LEADER] Iniciando monitoramento em background do nó falho: %s", failedNodeAddress)
-    
-    pingClient := http.Client{Timeout: 2 * time.Second}
-    
-    // Ticker é melhor para loops, para não recriar a goroutine
-    ticker := time.NewTicker(20 * time.Second) 
-    defer ticker.Stop()
+	log.Printf("[MATCHMAKING] [LEADER] Iniciando monitoramento em background do nó falho: %s", failedNodeAddress)
 
-    // Este é o endereço que queremos restaurar
-    originalNextAddress := s.allServers[(s.myIndex+1)%len(s.allServers)]
+	pingClient := http.Client{Timeout: 2 * time.Second}
 
-    // Verificação de sanidade
-    if failedNodeAddress != originalNextAddress {
-        log.Printf("[MATCHMAKING] [LEADER] Lógica de monitoramento inconsistente. Abortando. Nó falho: %s, Nó original esperado: %s", failedNodeAddress, originalNextAddress)
-        return
-    }
+	// Ticker é melhor para loops, para não recriar a goroutine
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
 
-    // Loop infinito de verificação
-    for range ticker.C {
-        // Pinga o nó que FALHOU (não s.nextServerAddress)
-        _, err := pingClient.Get(failedNodeAddress + "/api/health-check")
-        
-        if err == nil {
-            // SUCESSO! O nó falho original voltou!
-            log.Printf("[MATCHMAKING] [LEADER] Nó original %s voltou! A reconfigurar anel.", failedNodeAddress)
+	// Este é o endereço que queremos restaurar
+	originalNextAddress := s.allServers[(s.myIndex+1)%len(s.allServers)]
 
-            // Reconfigura o 'nextServerAddress' para o nó que acabou de voltar
-            // É seguro fazer isso, pois o líder é o único que muda s.nextServerAddress
-            s.nextServerAddress = failedNodeAddress
-            
-            // A goroutine termina seu trabalho e sai do loop/função.
-            return
-        }
+	// Verificação de sanidade
+	if failedNodeAddress != originalNextAddress {
+		log.Printf("[MATCHMAKING] [LEADER] Lógica de monitoramento inconsistente. Abortando. Nó falho: %s, Nó original esperado: %s", failedNodeAddress, originalNextAddress)
+		return
+	}
 
-        // FALHA: O servidor ainda não voltou
-        log.Printf("[MATCHMAKING] [LEADER] Monitoramento: Nó %s ainda offline.", failedNodeAddress)
-    }
+	// Loop infinito de verificação
+	for range ticker.C {
+		// Pinga o nó que FALHOU (não s.nextServerAddress)
+		_, err := pingClient.Get(failedNodeAddress + "/api/health-check")
+
+		if err == nil {
+			// SUCESSO! O nó falho original voltou!
+			log.Printf("[MATCHMAKING] [LEADER] Nó original %s voltou! A reconfigurar anel.", failedNodeAddress)
+
+			// Reconfigura o 'nextServerAddress' para o nó que acabou de voltar
+			// É seguro fazer isso, pois o líder é o único que muda s.nextServerAddress
+			s.nextServerAddress = failedNodeAddress
+
+			// A goroutine termina seu trabalho e sai do loop/função.
+			return
+		}
+
+		// FALHA: O servidor ainda não voltou
+		log.Printf("[MATCHMAKING] [LEADER] Monitoramento: Nó %s ainda offline.", failedNodeAddress)
+	}
 }
 
 // processMatchmakingQueue verifica a fila de jogadores e tenta criar partidas.
@@ -464,34 +464,34 @@ func (s *MatchmakingService) findAndCreateDistributedMatch(localPlayer *protocol
 
 // passTokenToNextServer envia uma requisição HTTP para passar o token.
 func (s *MatchmakingService) passTokenToNextServer() {
-    if s.currentToken == nil {
-        // Isto pode acontecer se formos um seguidor e o token
-        // ainda não tiver chegado. Não é um erro.
-        log.Printf("[MATCHMAKING] Sem token para passar. A aguardar a próxima volta.")
-        return 
-    }
+	if s.currentToken == nil {
+		// Isto pode acontecer se formos um seguidor e o token
+		// ainda não tiver chegado. Não é um erro.
+		log.Printf("[MATCHMAKING] Sem token para passar. A aguardar a próxima volta.")
+		return
+	}
 
-    // Atualiza o dono do token e serializa
-    s.currentToken.UpdateServerAddr(s.nextServerAddress)
-    tokenJSON, err := s.currentToken.ToJSON()
-    if err != nil {
-        log.Printf("[MATCHMAKING] ERRO ao serializar token de cartas: %v", err)
-        return
-    }
+	// Atualiza o dono do token e serializa
+	s.currentToken.UpdateServerAddr(s.nextServerAddress)
+	tokenJSON, err := s.currentToken.ToJSON()
+	if err != nil {
+		log.Printf("[MATCHMAKING] ERRO ao serializar token de cartas: %v", err)
+		return
+	}
 
-    log.Printf("[MATCHMAKING] A passar o token de cartas (%d no pool) para %s...", s.currentToken.GetPoolSize(), s.nextServerAddress)
+	log.Printf("[MATCHMAKING] A passar o token de cartas (%d no pool) para %s...", s.currentToken.GetPoolSize(), s.nextServerAddress)
 
-    // Envia via HTTP
-    postClient := &http.Client{Timeout: 5 * time.Second}
-    if resp, err2 := postClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(tokenJSON)); err2 == nil {
-        if resp != nil {
-            _ = resp.Body.Close()
-        }
-        // Limpa o token local APÓS passar com sucesso
-        s.currentToken = nil
-        log.Printf("[MATCHMAKING] Token passado com sucesso.")
-    } else {
-        log.Printf("[MATCHMAKING] ERRO ao passar token de cartas: %v", err2)
+	// Envia via HTTP
+	postClient := &http.Client{Timeout: 5 * time.Second}
+	if resp, err2 := postClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(tokenJSON)); err2 == nil {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		// Limpa o token local APÓS passar com sucesso
+		s.currentToken = nil
+		log.Printf("[MATCHMAKING] Token passado com sucesso.")
+	} else {
+		log.Printf("[MATCHMAKING] ERRO ao passar token de cartas: %v", err2)
 		_, errHealth := http.Get(s.nextServerAddress + "/api/health-check")
 		time.Sleep(10 * time.Second)
 		if errHealth != nil {
@@ -499,10 +499,10 @@ func (s *MatchmakingService) passTokenToNextServer() {
 			log.Println("[MATCHMAKING] [LEADER] A reconfigurar anel para pular o nó falho.")
 
 			newNextIndex := (s.myIndex + 2) % len(s.allServers) // Lógica de pular (N+2)
-			
+
 			// 1. Salve o endereço do nó que acabou de falhar
-			originalNextFailedNode := s.nextServerAddress 
-			
+			originalNextFailedNode := s.nextServerAddress
+
 			// 2. Configure o novo 'nextServerAddress' para pular o nó
 			s.nextServerAddress = s.allServers[newNextIndex]
 
@@ -514,35 +514,35 @@ func (s *MatchmakingService) passTokenToNextServer() {
 
 			// 3. Reseta o watchdog.
 			s.watchdogTimer.Reset(s.getWatchdogTimeout())
-			
+
 			// 4. Inicie o monitoramento passando o nó FALHO como argumento
 			go s.monitorFailedNode(originalNextFailedNode)
 		} else {
 			postClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(tokenJSON))
 		}
-    }
+	}
 }
 
 func (s *MatchmakingService) regenerateAndSetToken() {
-    log.Println("[MATCHMAKING] [REGENERATION] A regenerar token de cartas global...")
+	log.Println("[MATCHMAKING] [REGENERATION] A regenerar token de cartas global...")
 
-    // Esta lógica é movida de 'main.go'
-    newToken := token.NewToken(s.serverAddress)
-    cardsData, err := ioutil.ReadFile("cards.json") // (precisa importar "io/ioutil")
-    if err != nil {
-        log.Printf("[MATCHMAKING] [REGENERATION] ERRO FATAL: não foi possível ler cards.json para regenerar token: %v", err)
-        // O servidor ficará num estado degradado sem token
-        return
-    }
+	// Esta lógica é movida de 'main.go'
+	newToken := token.NewToken(s.serverAddress)
+	cardsData, err := ioutil.ReadFile("cards.json") // (precisa importar "io/ioutil")
+	if err != nil {
+		log.Printf("[MATCHMAKING] [REGENERATION] ERRO FATAL: não foi possível ler cards.json para regenerar token: %v", err)
+		// O servidor ficará num estado degradado sem token
+		return
+	}
 
-    // Usando 10 cópias, como em main.go
-    if err := newToken.LoadCardsFromJSON(cardsData, 10); err != nil {
-        log.Printf("[MATCHMAKING] [REGENERATION] ERRO FATAL: não foi possível carregar cartas no token regenerado: %v", err)
-        return
-    }
+	// Usando 10 cópias, como em main.go
+	if err := newToken.LoadCardsFromJSON(cardsData, 10); err != nil {
+		log.Printf("[MATCHMAKING] [REGENERATION] ERRO FATAL: não foi possível carregar cartas no token regenerado: %v", err)
+		return
+	}
 
-    log.Printf("[MATCHMAKING] [REGENERATION] Novo token regenerado com %d cartas.", newToken.GetPoolSize())
-    s.currentToken = newToken // Define o token regenerado
+	log.Printf("[MATCHMAKING] [REGENERATION] Novo token regenerado com %d cartas.", newToken.GetPoolSize())
+	s.currentToken = newToken // Define o token regenerado
 }
 
 // SetToken permite ao servidor de API injetar o token de cartas recebido
