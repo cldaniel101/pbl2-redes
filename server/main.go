@@ -116,7 +116,6 @@ func main() {
 	// 5. Lógica de Arranque do Token
 	// O primeiro servidor na lista é responsável por criar e iniciar o token.
 	if myIndex == 0 {
-		log.Println("[MAIN] Eu sou o nó inicial. A criar e a passar o token pela primeira vez após 5 segundos...")
 		go func() {
 			time.Sleep(5 * time.Second) // Espera um pouco para os outros servidores estarem online
 			initialStock := 1000

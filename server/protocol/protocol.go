@@ -57,6 +57,7 @@ type PlayerView struct {
 // TokenState representa o estado global que é passado junto com o token.
 type TokenState struct {
 	PackStock int `json:"packStock"`
+	GeneratedByLeaderIdx int `json:"generatedByLeaderIdx"`
 }
 
 // Constantes de tipos de mensagens

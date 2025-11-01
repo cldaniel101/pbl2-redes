@@ -50,7 +50,13 @@ func (s *APIServer) Router() http.Handler {
 	mux.HandleFunc("/api/receive-token", s.handleReceiveToken)
 	mux.HandleFunc("/matches/", s.handleMatchAction)
 	mux.HandleFunc("/api/forward/message", s.handleForwardMessage)
+	mux.HandleFunc("/api/health-check", s.handleHealthCheck)
 	return mux
+}
+
+// handleHealthCheck é um endpoint simples para verificar se o servidor está online.
+func (s *APIServer) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
 }
 
 // sendToPlayer publica uma mensagem para um jogador específico através do broker.
