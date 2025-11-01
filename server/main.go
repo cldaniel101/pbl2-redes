@@ -8,7 +8,6 @@ import (
 	"pingpong/server/api"
 	"pingpong/server/matchmaking"
 	"pingpong/server/network"
-	"pingpong/server/protocol"
 	"pingpong/server/pubsub"
 	"pingpong/server/state"
 	"pingpong/server/token"
@@ -46,7 +45,7 @@ func main() {
 	broker := pubsub.NewBroker()
 
 	// Canal para o APIServer notificar o MatchmakingService quando o token chegar.
-	tokenAcquiredChan := make(chan protocol.TokenState, 1)
+	tokenAcquiredChan := make(chan *token.Token, 1)
 
 	// 2.1. Inicialização do Token (apenas no primeiro servidor)
 	var initialToken *token.Token
@@ -91,7 +90,6 @@ func main() {
 	// Conecta o receptor de token de cartas ao serviço de matchmaking
 	apiServer.SetTokenReceiver(matchmakingService)
 
-	// sm *state.StateManager, broker *pubsub.Broker, tokenChan chan<- protocol.TokenState, serverAddr string
 
 	// Servidor TCP (para comunicação com os clientes)
 	tcpServer := network.NewTCPServer(
@@ -117,10 +115,10 @@ func main() {
 	// O primeiro servidor na lista é responsável por criar e iniciar o token.
 	if myIndex == 0 {
 		go func() {
-			time.Sleep(5 * time.Second) // Espera um pouco para os outros servidores estarem online
-			initialStock := 1000
-			log.Printf("[MAIN] A injetar estado inicial no token: %d pacotes", initialStock)
-			tokenAcquiredChan <- protocol.TokenState{PackStock: initialStock}
+			time.Sleep(5 * time.Second) // Espera pelos outros servidores
+			log.Printf("[MAIN] A injetar token inicial de cartas (%d cartas) no anel...", initialToken.GetPoolSize())
+			// Envia o token de cartas *real* para o canal
+			tokenAcquiredChan <- initialToken 
 		}()
 	}
 

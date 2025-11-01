@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io/ioutil"
 	"fmt"
 	"log"
 	"net/http"
@@ -25,7 +26,7 @@ type MatchmakingService struct {
 	serverAddress     string                   // Endereço deste servidor (ex: http://server-1:8000)
 	allServers        []string                 // Lista de todos os servidores no cluster
 	nextServerAddress string                   // O próximo servidor no anel
-	tokenChan         chan protocol.TokenState // Canal para receber e (no líder) reinjetar o token
+	tokenChan         chan *token.Token // Canal para receber e (no líder) reinjetar o token
 	myIndex           int                      // Nosso índice na lista allServers
 	isLeader          bool                     //  Flag para indicar se este nó é o líder
 	leaderMu          sync.Mutex               //  Mutex para proteger a flag isLeader
@@ -37,7 +38,7 @@ type MatchmakingService struct {
 }
 
 // NewService cria uma nova instância do serviço de matchmaking.
-func NewService(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan protocol.TokenState, selfAddr string, allAddrs []string, nextAddr string) *MatchmakingService {
+func NewService(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan *token.Token, selfAddr string, allAddrs []string, nextAddr string) *MatchmakingService {
 	// Encontra o nosso próprio índice.
 	myIndex := -1
 	for i, addr := range allAddrs {
@@ -127,31 +128,57 @@ func (s *MatchmakingService) resetTimers() {
 }
 
 // promoteToLeader promove este nó a líder.
+func (s *MatchmakingService) processPackRequests() {
+    requests := s.stateManager.DequeueAllPackRequests()
+    if len(requests) == 0 {
+        return // Sem pedidos, sem trabalho.
+    }
+
+    // Se não tivermos o token de cartas, não podemos processar.
+    // Os pedidos ficarão na fila para a próxima volta.
+    if s.currentToken == nil {
+        log.Printf("[MATCHMAKING] %d pedidos de pacote em espera, mas o token de cartas não está presente.", len(requests))
+        return
+    }
+
+    log.Printf("[MATCHMAKING] A processar %d pedidos de pacotes. Pool de cartas atual: %d", len(requests), s.currentToken.GetPoolSize())
+
+    // O número de cartas por pacote (deveria vir de uma config,
+    // mas 3 é o valor no state/manager.go)
+    const cardsPerPack = 3 
+
+    for _, req := range requests {
+        // Tenta retirar 3 cartas do pool global
+        cards, err := s.currentToken.DrawCards(cardsPerPack)
+
+        if err != nil {
+            // Erro (provavelmente pool insuficiente)
+            req.ReplyChan <- state.PackResult{Err: errors.New("estoque de cartas esgotado")}
+            log.Printf("[MATCHMAKING] Pedido de pacote de %s rejeitado: %v", req.PlayerID, err)
+        } else {
+            // Sucesso
+            req.ReplyChan <- state.PackResult{Cards: cards}
+            log.Printf("[MATCHMAKING] Pacote aberto para %s. Cartas: %v. Pool restante: %d", req.PlayerID, cards, s.currentToken.GetPoolSize())
+        }
+    }
+    // s.currentToken foi modificado diretamente (DrawCards removeu cartas)
+}
+
 func (s *MatchmakingService) promoteToLeader() {
-	s.leaderMu.Lock()
-	if s.isLeader {
-		s.leaderMu.Unlock()
-		return // Já somos o líder
-	}
+    // ... (lógica de Lock) ...
+    s.isLeader = true
+    s.leaderMu.Unlock()
 
-	log.Println("[MATCHMAKING] [ELECTION] A promover este nó a LÍDER.")
-	s.isLeader = true
-	s.leaderMu.Unlock()
+    s.resetTimers()
 
-	// Transição de timers: para o de eleição e inicia o de watchdog
-	s.resetTimers()
+    log.Println("[MATCHMAKING] [NEW LEADER] A regenerar e injetar o token...")
+    s.regenerateAndSetToken() // Gera o token de cartas (s.currentToken)
 
-	// Como novo líder, devemos regenerar e injetar o token imediatamente
-	log.Println("[MATCHMAKING] [NEW LEADER] A regenerar e injetar o token...")
-	tokenState := protocol.TokenState{
-		PackStock:            s.lastKnownStock,
-		GeneratedByLeaderIdx: s.myIndex,
-	}
-
-	// A injeção é feita enviando para o nosso próprio canal
-	go func() {
-		s.tokenChan <- tokenState
-	}()
+    // Injeta o token que acabámos de criar no *nosso próprio* canal
+    // para iniciar o ciclo.
+    go func(tokenToInject *token.Token) {
+        s.tokenChan <- tokenToInject
+    }(s.currentToken) 
 }
 
 // Run inicia o loop principal do serviço de matchmaking (agora unificado).
@@ -162,40 +189,33 @@ func (s *MatchmakingService) Run() {
 	for {
 		select {
 		// --- Caso 1: Token é recebido (Cenário Normal) ---
-		case tokenState, ok := <-s.tokenChan:
+		case receivedToken, ok := <-s.tokenChan:
 			if !ok {
 				log.Println("[MATCHMAKING] Canal do token fechado. Encerrando.")
 				return
 			}
 
-			log.Println("[MATCHMAKING] Token recebido. A processar...")
+			log.Println("[MATCHMAKING] Token de cartas recebido. A processar...")
+			s.currentToken = receivedToken // Armazena o token recebido
 
 			s.leaderMu.Lock()
-			if s.isLeader && tokenState.GeneratedByLeaderIdx < s.myIndex {
-				log.Printf("[MATCHMAKING] Recebido token do líder %d (prioridade >). A demitir-me para seguidor.", tokenState.GeneratedByLeaderIdx)
-				s.isLeader = false
-			}
+			// NOTA: A lógica 'tokenState.GeneratedByLeaderIdx' não existe
+			// no token.Token. Se a lógica de eleição avançada for
+			// necessária, esse campo precisaria ser adicionado ao token.Token.
 			s.leaderMu.Unlock()
 
 			// O anel está vivo. Reinicia o timer apropriado.
 			s.resetTimers()
 
-			// Processa e passa o token (lógica original)
-			s.ensureTokenInitialized()
-			updatedTokenState := s.processPackRequests(tokenState)
+			// NÃO É MAIS NECESSÁRIO: s.ensureTokenInitialized()
+
+			// Processa as filas usando s.currentToken
+			s.processPackRequests()
 			s.processMatchmakingQueue()
 			time.Sleep(2 * time.Second) // Simula trabalho
 
-			// Adiciona o nosso índice de líder ao passar, se formos o líder
-			/* // DESCOMENTE QUANDO protocol.TokenState FOR ATUALIZADO
-			s.leaderMu.Lock()
-			if s.isLeader {
-				updatedTokenState.GeneratedByLeaderIdx = s.myIndex
-			}
-			s.leaderMu.Unlock()
-			*/
-
-			s.passTokenToNextServer(updatedTokenState)
+			// Passa o token (que está em s.currentToken)
+			s.passTokenToNextServer()
 
 		// --- Caso 2: Watchdog do LÍDER dispara (Token perdido) ---
 		case <-s.watchdogTimer.C:
@@ -248,20 +268,17 @@ func (s *MatchmakingService) Run() {
 
 			// 2. Regenera, processa e passa o token.
 			log.Println("[MATCHMAKING] [LEADER] A regenerar e processar token...")
-			tokenState := protocol.TokenState{
-				PackStock:            s.lastKnownStock,
-				GeneratedByLeaderIdx: s.myIndex,
-			}
-			s.ensureTokenInitialized()
-			updatedTokenState := s.processPackRequests(tokenState)
+			s.regenerateAndSetToken() // Define s.currentToken
+
+			// Processa as filas locais com o novo token
+			s.processPackRequests()
 			s.processMatchmakingQueue()
-			time.Sleep(2 * time.Second) // Simula trabalho
+			time.Sleep(2 * time.Second) 
 
 			log.Println("[MATCHMAKING] [LEADER] A repassar token...")
-			s.passTokenToNextServer(updatedTokenState)
+			s.passTokenToNextServer() // Passa o s.currentToken
 
 			// 3. Reseta o watchdog.
-			log.Println("[MATCHMAKING] [LEADER] Watchdog resetado após regeneração.")
 			s.watchdogTimer.Reset(s.getWatchdogTimeout())
 			go s.returnTotheInitialNodes()
 
@@ -311,9 +328,6 @@ func (s *MatchmakingService) Run() {
 	}
 }
 
-// runFollower E runLeader SÃO AGORA OBSOLETOS.
-// A lógica está toda unificada em Run().
-
 func (s *MatchmakingService) returnTotheInitialNodes() {
 	time.Sleep(20 * time.Second)
 	pingClient := http.Client{Timeout: 2 * time.Second}
@@ -335,48 +349,6 @@ func (s *MatchmakingService) returnTotheInitialNodes() {
 		s.nextServerAddress = s.allServers[newNextIndex]
 	}
 
-}
-
-// processPackRequests processa a fila de pedidos de pacotes.
-// Retorna o estado do token atualizado.
-func (s *MatchmakingService) processPackRequests(currentState protocol.TokenState) protocol.TokenState {
-	requests := s.stateManager.DequeueAllPackRequests()
-	if len(requests) == 0 {
-		// Atualiza o último estoque conhecido mesmo sem pedidos
-		s.lastKnownStock = currentState.PackStock
-		return currentState // Sem pedidos, estado não muda.
-	}
-
-	log.Printf("[MATCHMAKING] A processar %d pedidos de pacotes. Estoque atual: %d", len(requests), currentState.PackStock)
-
-	packsBefore := currentState.PackStock
-	for _, req := range requests {
-		if currentState.PackStock > 0 {
-			// Há estoque, processa o pedido.
-			currentState.PackStock--
-			s.totalPacksOpened++ // Incrementa contador de auditoria
-			cards := s.stateManager.PackSystem.GenerateCardsForPack()
-
-			// Envia o resultado de volta para a goroutine do jogador.
-			req.ReplyChan <- state.PackResult{Cards: cards}
-
-			log.Printf("[MATCHMAKING] Pacote aberto para %s. Cartas: %v. Estoque restante: %d", req.PlayerID, cards, currentState.PackStock)
-		} else {
-			// Estoque esgotado.
-			req.ReplyChan <- state.PackResult{Err: errors.New("estoque de pacotes esgotado")}
-			log.Printf("[MATCHMAKING] Pedido de pacote de %s rejeitado. Estoque esgotado.", req.PlayerID)
-		}
-	}
-
-	// Atualiza o último estoque conhecido e registra auditoria
-	s.lastKnownStock = currentState.PackStock
-	packsOpened := packsBefore - currentState.PackStock
-	if packsOpened > 0 {
-		log.Printf("[MATCHMAKING] 📦 Auditoria: %d pacotes abertos nesta rodada. Total acumulado: %d. Estoque atual: %d",
-			packsOpened, s.totalPacksOpened, currentState.PackStock)
-	}
-
-	return currentState
 }
 
 // processMatchmakingQueue verifica a fila de jogadores e tenta criar partidas.
@@ -504,73 +476,65 @@ func (s *MatchmakingService) findAndCreateDistributedMatch(localPlayer *protocol
 }
 
 // passTokenToNextServer envia uma requisição HTTP para passar o token.
-func (s *MatchmakingService) passTokenToNextServer(currentState protocol.TokenState) {
-	// Envia o token de cartas junto (se existir) para “regeneração” do dono
-	if s.currentToken != nil {
-		s.currentToken.UpdateServerAddr(s.nextServerAddress)
-		tokenJSON, err := s.currentToken.ToJSON()
-		if err == nil {
-			log.Printf("[MATCHMAKING] A passar o token de cartas (%d no pool) para %s...", s.currentToken.GetPoolSize(), s.nextServerAddress)
+func (s *MatchmakingService) passTokenToNextServer() {
+    if s.currentToken == nil {
+        // Isto pode acontecer se formos um seguidor e o token
+        // ainda não tiver chegado. Não é um erro.
+        log.Printf("[MATCHMAKING] Sem token para passar. A aguardar a próxima volta.")
+        return 
+    }
 
-			// Usar um cliente com timeout maior para a passagem do token
-			postClient := &http.Client{Timeout: 5 * time.Second}
-			if resp, err2 := postClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(tokenJSON)); err2 == nil {
-				if resp != nil {
-					_ = resp.Body.Close()
-				}
-				// Limpa token local após passar
-				s.currentToken = nil
-				return
-			} else {
-				log.Printf("[MATCHMAKING] ERRO ao passar token de cartas: %v", err2)
-			}
-		} else {
-			log.Printf("[MATCHMAKING] ERRO ao serializar token de cartas: %v", err)
-		}
-	}
+    // Atualiza o dono do token e serializa
+    s.currentToken.UpdateServerAddr(s.nextServerAddress)
+    tokenJSON, err := s.currentToken.ToJSON()
+    if err != nil {
+        log.Printf("[MATCHMAKING] ERRO ao serializar token de cartas: %v", err)
+        return
+    }
 
-	// Fallback: envia apenas o estado de pacotes
-	log.Printf("[MATCHMAKING] A passar o token para %s com estado: %+v...", s.nextServerAddress, currentState)
-	requestBody, err := json.Marshal(currentState)
-	if err != nil {
-		log.Printf("[MATCHMAKING] ERRO ao serializar o estado do token: %v", err)
-		return
-	}
+    log.Printf("[MATCHMAKING] A passar o token de cartas (%d no pool) para %s...", s.currentToken.GetPoolSize(), s.nextServerAddress)
 
-	postClient := &http.Client{Timeout: 5 * time.Second}
-	_, err = postClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(requestBody))
-	if err != nil {
-		log.Printf("[MATCHMAKING] ERRO ao passar o token para %s: %v.", s.nextServerAddress, err)
-	} else {
-		log.Printf("[MATCHMAKING] Token passado com sucesso.")
-	}
+    // Envia via HTTP
+    postClient := &http.Client{Timeout: 5 * time.Second}
+    if resp, err2 := postClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(tokenJSON)); err2 == nil {
+        if resp != nil {
+            _ = resp.Body.Close()
+        }
+        // Limpa o token local APÓS passar com sucesso
+        s.currentToken = nil
+        log.Printf("[MATCHMAKING] Token passado com sucesso.")
+    } else {
+        log.Printf("[MATCHMAKING] ERRO ao passar token de cartas: %v", err2)
+        // NOTA: Se falhar, s.currentToken *não* é limpo,
+        // e o líder (se formos nós) irá detetar e tentar novamente.
+    }
+}
+
+func (s *MatchmakingService) regenerateAndSetToken() {
+    log.Println("[MATCHMAKING] [REGENERATION] A regenerar token de cartas global...")
+
+    // Esta lógica é movida de 'main.go'
+    newToken := token.NewToken(s.serverAddress)
+    cardsData, err := ioutil.ReadFile("cards.json") // (precisa importar "io/ioutil")
+    if err != nil {
+        log.Printf("[MATCHMAKING] [REGENERATION] ERRO FATAL: não foi possível ler cards.json para regenerar token: %v", err)
+        // O servidor ficará num estado degradado sem token
+        return
+    }
+
+    // Usando 10 cópias, como em main.go
+    if err := newToken.LoadCardsFromJSON(cardsData, 10); err != nil {
+        log.Printf("[MATCHMAKING] [REGENERATION] ERRO FATAL: não foi possível carregar cartas no token regenerado: %v", err)
+        return
+    }
+
+    log.Printf("[MATCHMAKING] [REGENERATION] Novo token regenerado com %d cartas.", newToken.GetPoolSize())
+    s.currentToken = newToken // Define o token regenerado
 }
 
 // SetToken permite ao servidor de API injetar o token de cartas recebido
 func (s *MatchmakingService) SetToken(t *token.Token) {
 	s.currentToken = t
-}
-
-// ensureTokenInitialized cria e carrega o token a partir do CardDB caso ainda não exista
-func (s *MatchmakingService) ensureTokenInitialized() {
-	if s.currentToken != nil {
-		return
-	}
-	s.currentToken = token.NewToken(s.serverAddress)
-	all := s.stateManager.CardDB.GetAllCards()
-	type cardInfo struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		Element string `json:"element"`
-		ATK     int    `json:"atk"`
-		DEF     int    `json:"def"`
-	}
-	buf := make([]cardInfo, 0, len(all))
-	for _, c := range all {
-		buf = append(buf, cardInfo{ID: c.ID, Name: c.Name, Element: string(c.Element), ATK: c.ATK, DEF: c.DEF})
-	}
-	raw, _ := json.Marshal(buf)
-	_ = s.currentToken.LoadCardsFromJSON(raw, 10)
 }
 
 // createMatchWithTokenCards cria uma partida usando cartas do token
