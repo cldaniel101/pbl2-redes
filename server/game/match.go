@@ -160,7 +160,7 @@ func (m *Match) PlayCard(playerID, cardID string) error {
 
 	// Se a partida for distribuída, retransmite a jogada para o outro servidor
 	// ANTES de registrar a jogada localmente.
-	m.forwardPlayIfNeeded(playerID, cardID)
+	go m.forwardPlayIfNeeded(playerID, cardID)
 
 	// Verifica se ambos jogaram
 	if len(m.Waiting) == 2 {

@@ -89,7 +89,7 @@ func NewService(sm *state.StateManager, broker *pubsub.Broker, tokenChan chan *t
 // getWatchdogTimeout calcula a duração do watchdog do líder.
 func (s *MatchmakingService) getWatchdogTimeout() time.Duration {
 	// O timeout do líder deve ser dinâmico e razoavelmente curto
-	return time.Duration(len(s.allServers)*16) * time.Second
+	return time.Duration(len(s.allServers)*5) * time.Second
 }
 
 // getElectionTimeout calcula a duração do timer de eleição do seguidor.
@@ -491,38 +491,55 @@ func (s *MatchmakingService) passTokenToNextServer() {
 		s.currentToken = nil
 		log.Printf("[MATCHMAKING] Token passado com sucesso.")
 	} else {
-		log.Printf("[MATCHMAKING] ERRO ao passar token de cartas: %v", err2)
+		// A primeira tentativa falhou.
+		log.Printf("[MATCHMAKING] ERRO ao passar token de cartas (tentativa 1): %v", err2)
+
+		// Verifica se o nó está vivo (health check)
 		_, errHealth := http.Get(s.nextServerAddress + "/api/health-check")
-		time.Sleep(10 * time.Second)
+		
 		if errHealth != nil {
-			log.Printf("[MATCHMAKING] [LEADER] VERIFICAÇÃO FALHOU: O nó %s está inacessível (%v).", s.nextServerAddress, err2) // 'err' aqui pode ser 'err2' do post
-			log.Println("[MATCHMAKING] [LEADER] A reconfigurar anel para pular o nó falho.")
+			// Saúde falhou: Nó está morto. Pular o nó.
+			log.Printf("[MATCHMAKING] VERIFICAÇÃO FALHOU: O nó %s está inacessível (%v).", s.nextServerAddress, errHealth)
+			log.Println("[MATCHMAKING] A reconfigurar anel para pular o nó falho.")
 
 			newNextIndex := (s.myIndex + 2) % len(s.allServers) // Lógica de pular (N+2)
-
-			// 1. Salve o endereço do nó que acabou de falhar
 			originalNextFailedNode := s.nextServerAddress
-
-			// 2. Configure o novo 'nextServerAddress' para pular o nó
 			s.nextServerAddress = s.allServers[newNextIndex]
 
-			log.Printf("[MATCHMAKING] [LEADER] Topologia reconfigurada. Próximo nó é: %s (pulado: %s)", s.nextServerAddress, originalNextFailedNode)
+			log.Printf("[MATCHMAKING] Topologia reconfigurada. Próximo nó é: %s (pulado: %s)", s.nextServerAddress, originalNextFailedNode)
+			log.Println("[MATCHMAKING] A repassar token...")
 
-			log.Println("[MATCHMAKING] [LEADER] A repassar token...")
 			// Tenta repassar para o novo nó imediatamente
-			postClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(tokenJSON))
+			if resp, err3 := postClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(tokenJSON)); err3 == nil {
+				// Sucesso ao passar para N+2
+				if resp != nil { _ = resp.Body.Close() }
+				s.currentToken = nil // Token passado
+				log.Printf("[MATCHMAKING] Token passado com sucesso para o nó substituto %s.", s.nextServerAddress)
+			} else {
+				// Falha ao passar para N+2 também. Mantém o token.
+				log.Printf("[MATCHMAKING] Falha ao passar token para o nó substituto %s: %v. O token será retido.", s.nextServerAddress, err3)
+			}
 
-			// 3. Reseta o watchdog.
 			s.watchdogTimer.Reset(s.getWatchdogTimeout())
-
-			// 4. Inicie o monitoramento passando o nó FALHO como argumento
 			go s.monitorFailedNode(originalNextFailedNode)
+
 		} else {
-			postClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(tokenJSON))
+			// Saúde OK: Nó está vivo, mas instável. Tenta mais uma vez.
+			log.Printf("[MATCHMAKING] Nó %s está vivo, mas falhou no POST. A tentar novamente...", s.nextServerAddress)
+			
+			// Tenta repassar para o mesmo nó (tentativa 2)
+			if resp, err3 := postClient.Post(s.nextServerAddress+"/api/receive-token", "application/json", bytes.NewBuffer(tokenJSON)); err3 == nil {
+				// Sucesso na tentativa 2
+				if resp != nil { _ = resp.Body.Close() }
+				s.currentToken = nil // Token passado
+				log.Printf("[MATCHMAKING] Token passado com sucesso (tentativa 2).")
+			} else {
+				// Falha na tentativa 2. Mantém o token.
+				log.Printf("[MATCHMAKING] Falha na segunda tentativa de passar o token: %v. O token será retido.", err3)
+			}
 		}
 	}
 }
-
 func (s *MatchmakingService) regenerateAndSetToken() {
 	log.Println("[MATCHMAKING] [REGENERATION] A regenerar token de cartas global...")
 
